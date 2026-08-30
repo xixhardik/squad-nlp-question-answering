@@ -33,6 +33,11 @@ testpaths = ["tests", "backend/tests"]
 pythonpath = ["src", "backend"]
 addopts = "-ra --strict-markers --strict-config"
 filterwarnings = ["error::DeprecationWarning:qa_core.*"]
+markers = [
+    "gpu: requires a CUDA device; skipped automatically on CPU-only machines",
+    "network: downloads a tokenizer or model from the Hugging Face Hub",
+    "slow: takes more than a few seconds",
+]
 
 # -----------------------------------------------------------------------------
 # ruff
@@ -68,9 +73,15 @@ ignore = [
 # Requiring a docstring on every assertion would add noise, not clarity, so the
 # docstring rules are relaxed for tests only. Explanatory docstrings are still
 # written wherever a test encodes a non-obvious fact.
-"tests/**" = ["D100", "D101", "D102", "D103", "D105", "D106", "D107", "ANN201", "ANN001"]
+"tests/**" = [
+    "D100", "D101", "D102", "D103", "D105", "D106", "D107",
+    # Test helpers and fixtures do not need full type annotations; the assertions
+    # are the specification and annotating pytest plumbing adds noise, not clarity.
+    "ANN001", "ANN002", "ANN003", "ANN201", "ANN202",
+]
 "backend/tests/**" = [
-    "D100", "D101", "D102", "D103", "D105", "D106", "D107", "ANN201", "ANN001",
+    "D100", "D101", "D102", "D103", "D105", "D106", "D107",
+    "ANN001", "ANN002", "ANN003", "ANN201", "ANN202",
 ]
 "ml/scripts/**" = ["T201"]  # diagnostics scripts legitimately print
 

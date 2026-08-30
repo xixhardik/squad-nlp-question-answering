@@ -26,10 +26,13 @@ data:
 
 training:
   num_train_epochs: 1
-  batch_size: 8
-  eval_batch_size: 16
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
   logging_steps: 5
   save_total_limit: 1
   # Warmup over a handful of steps is meaningless; keep the schedule simple so a
   # failure points at the pipeline rather than the LR schedule.
   warmup_ratio: 0.0
+  # fp32 so a smoke failure is unambiguously a pipeline bug, never a mixed-precision
+  # numerical issue. This also lets the smoke test run identically on CPU.
+  precision: fp32

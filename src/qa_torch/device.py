@@ -24,10 +24,12 @@ import torch
 __all__ = [
     "DeviceInfo",
     "DeviceUnavailableError",
+    "PrecisionPlan",
     "collect_cuda_diagnostics",
     "describe_device",
     "require_cuda",
     "resolve_device",
+    "resolve_precision",
 ]
 
 logger = logging.getLogger(__name__)
@@ -239,3 +241,132 @@ def require_cuda() -> torch.device:
             "Run `python ml/scripts/check_environment.py --require-cuda` first."
         )
     return torch.device("cuda")
+
+
+@dataclass(frozen=True, slots=True)
+class PrecisionPlan:
+    """Resolved mixed-precision settings for a training run.
+
+    Attributes:
+        requested: The value asked for in the config (``auto``/``fp32``/``fp16``/
+            ``bf16``).
+        resolved: What will actually be used.
+        bf16: Value to pass to ``TrainingArguments(bf16=...)``.
+        fp16: Value to pass to ``TrainingArguments(fp16=...)``.
+        reason: Human-readable explanation, recorded in the experiment metadata so
+            a run's precision choice is auditable after the fact.
+    """
+
+    requested: str
+    resolved: str
+    bf16: bool
+    fp16: bool
+    reason: str
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation for experiment records."""
+        return asdict(self)
+
+
+def resolve_precision(
+    requested: str,
+    device: torch.device | str | None = None,
+) -> PrecisionPlan:
+    """Decide the mixed-precision mode for a training run.
+
+    ``auto`` resolution order, and the reasoning behind it:
+
+    1. **CPU -> fp32.** Neither fp16 nor bf16 gives a useful speedup on CPU here,
+       and fp16 on CPU is poorly supported.
+    2. **CUDA with bf16 support -> bf16.** Preferred over fp16 because bfloat16
+       keeps fp32's exponent range, so it needs no gradient loss scaling. That
+       removes a whole class of silent divergence where fp16 gradients underflow
+       to zero. The NVIDIA L4 is Ada generation (compute capability 8.9) and is
+       expected to report bf16 support, but this is *queried*, never assumed.
+    3. **CUDA without bf16 support -> fp16.** Older hardware still benefits from
+       mixed precision; ``TrainingArguments`` handles the loss scaling.
+
+    An explicit request is honoured rather than silently downgraded, so a
+    benchmark can pin one setting. The single exception is fp16/bf16 on CPU, which
+    would fail inside the trainer with a much less obvious error.
+
+    Args:
+        requested: ``auto``, ``fp32``, ``fp16`` or ``bf16``.
+        device: Target device. When ``None``, :func:`resolve_device` is called.
+
+    Returns:
+        The resolved :class:`PrecisionPlan`.
+
+    Raises:
+        ValueError: If ``requested`` is not a recognised precision.
+
+    Examples:
+        >>> plan = resolve_precision("auto", "cpu")
+        >>> (plan.resolved, plan.bf16, plan.fp16)
+        ('fp32', False, False)
+    """
+    valid = ("auto", "fp32", "fp16", "bf16")
+    choice = requested.strip().lower()
+    if choice not in valid:
+        raise ValueError(
+            f"Unknown precision {requested!r}. Expected one of: {', '.join(valid)}."
+        )
+
+    if device is None:
+        device = resolve_device()
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    is_cuda = device.type == "cuda"
+    bf16_supported = False
+    if is_cuda:
+        try:
+            bf16_supported = bool(torch.cuda.is_bf16_supported())
+        except Exception:  # pragma: no cover - depends on torch build
+            bf16_supported = False
+
+    if choice == "auto":
+        if not is_cuda:
+            return PrecisionPlan(
+                requested=choice,
+                resolved="fp32",
+                bf16=False,
+                fp16=False,
+                reason=f"device is {device.type}; mixed precision only benefits CUDA",
+            )
+        if bf16_supported:
+            return PrecisionPlan(
+                requested=choice,
+                resolved="bf16",
+                bf16=True,
+                fp16=False,
+                reason="CUDA reports bf16 support; preferred over fp16 (no loss scaling)",
+            )
+        return PrecisionPlan(
+            requested=choice,
+            resolved="fp16",
+            bf16=False,
+            fp16=True,
+            reason="CUDA available but bf16 unsupported; falling back to fp16",
+        )
+
+    if choice in ("fp16", "bf16") and not is_cuda:
+        raise DeviceUnavailableError(
+            f"precision={choice!r} requires CUDA but the resolved device is "
+            f"{device.type!r}. Use precision='fp32' or 'auto' for CPU runs, or run "
+            "on the Lightning AI L4."
+        )
+
+    if choice == "bf16" and not bf16_supported:
+        logger.warning(
+            "precision='bf16' was requested explicitly but torch.cuda.is_bf16_supported() "
+            "is False. Honouring the request; expect failure or silent fallback."
+        )
+
+    return PrecisionPlan(
+        requested=choice,
+        resolved=choice,
+        bf16=choice == "bf16",
+        fp16=choice == "fp16",
+        reason="explicitly requested in the experiment configuration",
+    )

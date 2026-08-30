@@ -38,8 +38,8 @@ model_name: microsoft/deberta-v3-base
 
 training:
   # Larger embedding table and disentangled attention raise activation memory.
-  # Halved batch size with matching gradient accumulation keeps the effective
+  # Halved micro-batch with matching gradient accumulation keeps the effective
   # batch size equal to the other experiments, so the comparison stays fair.
-  batch_size: 8
+  per_device_train_batch_size: 8
   gradient_accumulation_steps: 2
-  eval_batch_size: 32
+  per_device_eval_batch_size: 32

@@ -4,10 +4,15 @@ A from-scratch extractive question answering system: fine-tune a Transformer
 encoder to locate the answer to a question **inside** a supplied passage, then
 serve it through a local API and web interface.
 
-> **Status: Phase 1 of 17 complete — project foundation.**
-> No model has been trained yet. **This document contains no accuracy figures,
-> because none have been measured.** Every metric published here later will be
+> **Status: Phase 2 of 17 complete — full ML pipeline implemented and executed on CPU.**
+> The pipeline runs end to end: dataset ingestion, character-to-token preprocessing with
+> sliding windows, training, explicit span decoding, and Exact Match / F1 evaluation.
+> **No GPU training has been run yet, so this document contains no accuracy results.**
+> A CPU smoke run (256 examples, 1 epoch) proved the path executes; its EM/F1 are
+> deliberately not quoted as results. Every metric published here later will be
 > generated from saved experiment records, never typed by hand.
+
+See [`docs/pipeline.md`](docs/pipeline.md) for the full technical walkthrough.
 
 ---
 
@@ -131,15 +136,29 @@ fails if importing `qa_core` pulls in torch, transformers, datasets or fastapi.
 ├── requirements-dev.txt     pytest, httpx, ruff
 │
 ├── src/
-│   ├── qa_core/             shared span logic. STDLIB ONLY, no torch
+│   ├── qa_core/             shared span logic. STDLIB ONLY, no torch, no numpy
 │   │   ├── normalize.py       official SQuAD answer normalization
 │   │   ├── metrics.py         Exact Match, token-level F1
 │   │   ├── spans.py           char span validation, tightening, extraction
+│   │   ├── alignment.py       SQuAD char offsets -> token start/end positions
+│   │   ├── postprocess.py     explicit n-best span decoding across windows
 │   │   └── schemas.py         dataclass contracts
-│   ├── qa_torch/            torch-dependent code
-│   │   └── device.py          device abstraction, CUDA diagnostics
+│   ├── qa_torch/            torch- and Hugging Face-dependent code
+│   │   ├── device.py          device abstraction, CUDA diagnostics, precision plan
+│   │   ├── loader.py          tokenizer / AutoModelForQuestionAnswering loading
+│   │   ├── features.py        explicit sliding-window feature building
+│   │   ├── engine.py          batched forward passes collecting start/end logits
+│   │   └── inference.py       the reusable single-question engine
 │   └── qa_ml/               training/evaluation orchestration
 │       ├── config.py          typed YAML experiment configuration
+│       ├── data.py            SQuAD loading, schema and offset verification
+│       ├── preprocess.py      dataset feature building and column separation
+│       ├── train.py           Trainer-backed training
+│       ├── evaluate.py        logits -> decoded text -> EM/F1
+│       ├── experiment.py      run directories and provenance records
+│       ├── seeding.py         reproducible seeding
+│       ├── environment.py     environment and git capture
+│       ├── cli.py             prepare / train / evaluate / predict
 │       ├── paths.py           repository-root and directory resolution
 │       └── logging_utils.py   logging setup
 │
@@ -252,42 +271,72 @@ pytest -m "not slow"                # skip slow tests
 ruff check .                        # lint
 ```
 
-What is covered in Phase 1 — all real behaviour, no placeholder assertions:
+**622 passed, 17 skipped** (all skips are CUDA-only tests on this CPU-only machine).
 
 | Area | Verifies |
 |---|---|
 | `test_normalize.py` | SQuAD normalization: case, punctuation, articles, whitespace, ordering |
 | `test_metrics.py` | EM and F1, multiset token overlap, multi-gold maximum, empty-string edges |
 | `test_spans.py` | Span validation, whitespace tightening, per-tokenizer offset regressions |
-| `test_config.py` | YAML loading, inheritance, strict key rejection, hash determinism, controlled-variable equality across experiments |
+| `test_alignment.py` | Character-to-token alignment, partial-token answers, answers outside a window |
+| `test_features.py` | Real-tokenizer feature building across WordPiece/BPE, **window coverage regression**, labels decoding back to gold answers |
+| `test_postprocess.py` | Span decoding: shortlisting, validity filtering, pooled softmax, determinism |
+| `test_evaluate.py` | Feature-to-example regrouping, EM/F1 from logits, **cross-check against the `evaluate` library** |
+| `test_data.py` | SQuAD schema, offset verification, SQuAD 2.0 rejection |
+| `test_train_setup.py` | Config-to-`TrainingArguments` adapter, `warmup_ratio` → float `warmup_steps`, CUDA gate |
+| `test_experiment.py` | Run directories never overwritten, complete provenance records |
+| `test_seeding.py` | Reproducible Python/NumPy/torch streams |
+| `test_gpu_smoke.py` | CUDA detection, device placement, forward/backward/optimizer step, bf16, peak memory |
+| `test_inference.py` | End-to-end engine, long-context windowing, **evaluation/inference decoding parity** |
+| `test_config.py` | YAML loading, inheritance, strict key rejection, hash determinism, controlled-variable equality |
 | `test_device.py` | Device resolution, no hard-coded `cuda:0`, no silent CPU downgrade |
 | `test_qa_core_isolation.py` | `qa_core` imports no heavy dependency (clean subprocess) |
 | `test_project_structure.py` | Layout, path robustness, `.gitignore` correctness, installed-versus-pinned versions |
 | `test_check_environment.py` | Diagnostics run on CPU, report CUDA truthfully, gate correctly |
 | `backend/tests/test_health.py` | `/health` contract, CORS allow-list, absence of `/predict` |
 
+## Pipeline commands
+
+```powershell
+# Validate the dataset and report feature/alignment statistics
+python -m qa_ml prepare --config smoke.yaml --build-features
+
+# Train (refuses CPU by default; --allow-cpu only for tiny smoke configs)
+python -m qa_ml train --config experiment_a_distilbert.yaml --cross-check
+
+# Evaluate a checkpoint
+python -m qa_ml evaluate --config experiment_a_distilbert.yaml \
+    --model artifacts/runs/<run_id>/model
+
+# Answer one question
+python -m qa_ml predict --config experiment_a_distilbert.yaml \
+    --model artifacts/runs/<run_id>/model \
+    --question "Which country contains the majority of the Amazon rainforest?" \
+    --context "The Amazon rainforest ... contained within Brazil ..."
+```
+
+Any config value can be overridden without editing files:
+`--set training.num_train_epochs=3 --set training.per_device_train_batch_size=32`
+
 ## Phase plan
 
 | Phase | Description | Status |
 |---:|---|---|
 | 0 | Architecture and repository audit | Complete |
-| **1** | **Project foundation and reproducible environment** | **Complete** |
-| 2 | Lightning L4 GPU environment validation | Not started |
-| 3 | SQuAD dataset exploration | Not started |
-| 4 | Tokenization and answer-span preprocessing | Not started |
-| 5 | Preprocessing unit tests | Not started |
-| 6 | DistilBERT smoke training | Not started |
-| 7 | DistilBERT full training | Not started |
-| 8 | DistilBERT evaluation | Not started |
-| 9 | BERT-base experiment | Not started |
-| 10 | Optional third-model experiment | Not started |
-| 11 | Model comparison | Not started |
-| 12 | Final inference engine | Not started |
-| 13 | FastAPI backend (full) | Not started |
-| 14 | Next.js frontend (full) | Not started |
-| 15 | Frontend/backend integration | Not started |
-| 16 | End-to-end local testing | Not started |
-| 17 | Documentation and final audit | Not started |
+| 1 | Project foundation and reproducible environment | Complete |
+| **2** | **Dataset, preprocessing, training, evaluation, decoding, CLI** | **Complete (CPU-verified)** |
+| 3 | Lightning L4 GPU validation and baseline training run | Next |
+| 4 | BERT-base experiment | Not started |
+| 5 | RoBERTa-base experiment | Not started |
+| 6 | Optional DeBERTa-v3 experiment (budget-gated) | Not started |
+| 7 | Model comparison and selection | Not started |
+| 8 | Error analysis | Not started |
+| 9 | Inference optimization | Not started |
+| 10 | FastAPI backend (full) | Not started |
+| 11 | Next.js frontend (full) | Not started |
+| 12 | Frontend/backend integration | Not started |
+| 13 | End-to-end local testing | Not started |
+| 14 | Documentation and final audit | Not started |
 
 Each phase has a quality gate that must pass, with recorded evidence, before the
 next begins.

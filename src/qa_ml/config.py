@@ -41,13 +41,14 @@ __all__ = [
     "DataConfig",
     "DecodingConfig",
     "ExperimentConfig",
+    "OutputConfig",
     "PreprocessingConfig",
     "TrainingConfig",
     "load_experiment_config",
     "resolve_config_mapping",
 ]
 
-_VALID_PRECISION = ("fp32", "fp16", "bf16")
+_VALID_PRECISION = ("auto", "fp32", "fp16", "bf16")
 _VALID_STRATEGY = ("no", "steps", "epoch")
 _VALID_SCHEDULER = ("linear", "cosine", "constant", "constant_with_warmup", "polynomial")
 _VALID_PADDING = ("max_length", "longest")
@@ -176,6 +177,7 @@ class DecodingConfig:
 
     n_best_size: int = 20
     max_answer_length: int = 30
+    max_n_best: int = 10
     score_type: str = "uncalibrated_span_probability"
 
     def validate(self) -> None:
@@ -192,6 +194,48 @@ class DecodingConfig:
             raise ConfigError(
                 f"decoding.max_answer_length must be positive, got {self.max_answer_length}."
             )
+        if self.max_n_best <= 0:
+            raise ConfigError(
+                f"decoding.max_n_best must be positive, got {self.max_n_best}."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class OutputConfig:
+    """Where an experiment writes its artifacts.
+
+    Attributes:
+        root: Directory holding run directories. ``None`` means
+            ``<artifacts>/runs``, which is git-ignored.
+        run_name: Fixed run directory name. ``None`` generates
+            ``<name>-<model>-<config_hash>-<UTC timestamp>``, which keeps runs
+            traceable to the exact configuration that produced them.
+        allow_existing: Whether an existing run directory may be reused. Default
+            ``False`` so a completed experiment can never be silently overwritten;
+            resuming a run is requested explicitly instead.
+        save_predictions: Write per-example n-best predictions for error analysis.
+    """
+
+    root: str | None = None
+    run_name: str | None = None
+    allow_existing: bool = False
+    save_predictions: bool = True
+
+    def validate(self) -> None:
+        """Check the output settings.
+
+        Raises:
+            ConfigError: If ``run_name`` is set but empty, or contains a path
+                separator (which would write outside the runs directory).
+        """
+        if self.run_name is not None:
+            if not self.run_name.strip():
+                raise ConfigError("output.run_name must be a non-empty string or null.")
+            if "/" in self.run_name or "\\" in self.run_name:
+                raise ConfigError(
+                    f"output.run_name must be a single directory name, got "
+                    f"{self.run_name!r}. Use output.root to change the parent."
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,16 +244,18 @@ class TrainingConfig:
 
     Attributes:
         learning_rate: Peak learning rate.
-        batch_size: Per-device training batch size.
-        eval_batch_size: Per-device evaluation batch size.
+        per_device_train_batch_size: Training batch size per device.
+        per_device_eval_batch_size: Evaluation batch size per device.
         gradient_accumulation_steps: Micro-batches accumulated per update.
         num_train_epochs: Number of passes over the training set.
         weight_decay: AdamW weight decay.
         warmup_ratio: Fraction of total steps spent warming up the LR.
         lr_scheduler_type: Learning-rate schedule shape.
         max_grad_norm: Gradient-clipping threshold.
-        precision: ``fp32``, ``fp16`` or ``bf16``. Benchmarked on the target GPU
-            before a headline run rather than assumed.
+        precision: ``auto``, ``fp32``, ``fp16`` or ``bf16``. ``auto`` resolves at
+            runtime to bf16 when the GPU supports it, else fp16 on CUDA, else
+            fp32 on CPU -- see :func:`qa_torch.device.resolve_precision`. An
+            explicit value is never overridden, so a benchmark can pin one.
         evaluation_strategy: When to evaluate (``no`` / ``steps`` / ``epoch``).
         save_strategy: When to checkpoint. Must match ``evaluation_strategy``
             when ``load_best_model_at_end`` is set.
@@ -221,19 +267,24 @@ class TrainingConfig:
         greater_is_better: Whether a higher value of that metric is better.
         dataloader_num_workers: Worker processes for data loading.
         gradient_checkpointing: Trade compute for activation memory.
+        early_stopping_patience: Evaluations without improvement before stopping.
+            ``None`` disables early stopping.
         resume_from_checkpoint: Optional checkpoint path to resume from.
+        full_determinism: Enable fully deterministic kernels. Substantially
+            slower, so it is off by default; seeding alone already makes runs
+            reproducible in practice.
     """
 
     learning_rate: float = 3e-5
-    batch_size: int = 16
-    eval_batch_size: int = 64
+    per_device_train_batch_size: int = 16
+    per_device_eval_batch_size: int = 64
     gradient_accumulation_steps: int = 1
     num_train_epochs: int = 2
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     lr_scheduler_type: str = "linear"
     max_grad_norm: float = 1.0
-    precision: str = "fp32"
+    precision: str = "auto"
     evaluation_strategy: str = "epoch"
     save_strategy: str = "epoch"
     logging_strategy: str = "steps"
@@ -244,7 +295,9 @@ class TrainingConfig:
     greater_is_better: bool = True
     dataloader_num_workers: int = 0
     gradient_checkpointing: bool = False
+    early_stopping_patience: int | None = None
     resume_from_checkpoint: str | None = None
+    full_determinism: bool = False
 
     def validate(self) -> None:
         """Check the training settings.
@@ -257,8 +310,13 @@ class TrainingConfig:
             raise ConfigError(
                 f"training.learning_rate must be positive, got {self.learning_rate}."
             )
-        if self.batch_size <= 0 or self.eval_batch_size <= 0:
+        if self.per_device_train_batch_size <= 0 or self.per_device_eval_batch_size <= 0:
             raise ConfigError("training batch sizes must be positive integers.")
+        if self.early_stopping_patience is not None and self.early_stopping_patience <= 0:
+            raise ConfigError(
+                "training.early_stopping_patience must be a positive integer or null, "
+                f"got {self.early_stopping_patience}."
+            )
         if self.gradient_accumulation_steps <= 0:
             raise ConfigError(
                 "training.gradient_accumulation_steps must be a positive integer, "
@@ -316,8 +374,13 @@ class TrainingConfig:
 
     @property
     def effective_batch_size(self) -> int:
-        """Batch size after gradient accumulation, per device."""
-        return self.batch_size * self.gradient_accumulation_steps
+        """Optimizer-step batch size on one device.
+
+        Held equal across all four experiments so the model comparison stays
+        fair: DeBERTa halves the micro-batch and doubles accumulation, which
+        lowers activation memory without changing the optimisation trajectory.
+        """
+        return self.per_device_train_batch_size * self.gradient_accumulation_steps
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +409,7 @@ class ExperimentConfig:
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
     decoding: DecodingConfig = field(default_factory=DecodingConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
 
     def validate(self) -> None:
         """Validate this config and every nested section.
@@ -361,6 +425,7 @@ class ExperimentConfig:
         self.preprocessing.validate()
         self.decoding.validate()
         self.training.validate()
+        self.output.validate()
 
     @property
     def effective_tokenizer_name(self) -> str:
@@ -394,8 +459,13 @@ class ExperimentConfig:
             timestamp: UTC timestamp string, e.g. ``"20260829T141500Z"``.
 
         Returns:
-            ``<name>-<model-slug>-<config-hash>-<timestamp>``.
+            ``output.run_name`` when set, otherwise
+            ``<name>-<model-slug>-<config-hash>-<timestamp>``. The ``/`` in a
+            Hugging Face model id is replaced with ``--`` so the result is a
+            single directory name rather than a nested path.
         """
+        if self.output.run_name is not None:
+            return self.output.run_name
         model_slug = self.model_name.replace("/", "--")
         return f"{self.name}-{model_slug}-{self.config_hash()}-{timestamp}"
 
@@ -409,6 +479,7 @@ _SECTION_TYPES: dict[str, type] = {
     "preprocessing": PreprocessingConfig,
     "decoding": DecodingConfig,
     "training": TrainingConfig,
+    "output": OutputConfig,
 }
 
 

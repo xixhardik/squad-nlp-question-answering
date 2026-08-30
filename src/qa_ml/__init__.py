@@ -29,6 +29,7 @@ from qa_ml.config import (
     DataConfig,
     DecodingConfig,
     ExperimentConfig,
+    OutputConfig,
     PreprocessingConfig,
     TrainingConfig,
     load_experiment_config,
@@ -36,13 +37,14 @@ from qa_ml.config import (
 from qa_ml.logging_utils import configure_logging, get_logger
 from qa_ml.paths import ProjectPaths, find_repo_root, get_paths
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "ConfigError",
     "DataConfig",
     "DecodingConfig",
     "ExperimentConfig",
+    "OutputConfig",
     "PreprocessingConfig",
     "ProjectPaths",
     "TrainingConfig",

@@ -50,9 +50,13 @@ preprocessing:
 
 decoding:
   # Shared verbatim by training-time evaluation and production inference.
+  # Start and end positions shortlisted per window. Bounds candidate pairs at
+  # n_best_size^2 (400) instead of max_seq_length^2 (147,456).
   n_best_size: 20
   # In tokens. SQuAD answers are short; this filters implausibly long spans.
   max_answer_length: 30
+  # How many ranked alternatives to keep per example, for error analysis.
+  max_n_best: 10
   # Honest label. A single softmax over the pooled set of valid candidate spans
   # from all windows is a proper distribution over considered hypotheses, but it
   # is NOT calibrated. Only change this after actually fitting a temperature and
@@ -61,8 +65,12 @@ decoding:
 
 training:
   learning_rate: 3.0e-5
-  batch_size: 16
-  eval_batch_size: 64
+  # Per device. 16 x 384 tokens is comfortable on the L4's ~22 GiB and is the
+  # conventional SQuAD setting; it is deliberately not pushed to the memory limit,
+  # because a run that OOMs at hour two wastes more time than a larger batch saves.
+  per_device_train_batch_size: 16
+  # Evaluation stores no activations, so it can use a larger batch than training.
+  per_device_eval_batch_size: 64
   gradient_accumulation_steps: 1
   # 2 epochs is the conventional SQuAD fine-tuning budget. With four models to
   # compare inside a fixed GPU allowance, a third epoch is not worth ~50% more
@@ -72,10 +80,15 @@ training:
   warmup_ratio: 0.1
   lr_scheduler_type: linear
   max_grad_norm: 1.0
-  # fp32 is the SAFE DEFAULT and is deliberately not fp16/bf16. Mixed precision
-  # is enabled per experiment only after being benchmarked on the actual L4 in
-  # Phase 2, per the "measure it, do not assume it" requirement.
-  precision: fp32
+  # auto resolves at RUNTIME, never at config load:
+  #   CUDA + torch.cuda.is_bf16_supported() -> bf16
+  #   CUDA without bf16 support             -> fp16
+  #   CPU                                   -> fp32
+  # bf16 is preferred over fp16 on the L4 (Ada, compute capability 8.9) because it
+  # has the same exponent range as fp32 and therefore needs no loss scaling, which
+  # removes a whole class of silent training divergence.
+  # Pin an explicit value (fp32/fp16/bf16) to benchmark one specific setting.
+  precision: auto
   evaluation_strategy: epoch
   save_strategy: epoch
   logging_strategy: steps
@@ -84,8 +97,26 @@ training:
   load_best_model_at_end: true
   metric_for_best_model: f1
   greater_is_better: true
-  # 0 on Windows: worker processes there are spawned, not forked, which makes
-  # them slow to start and awkward to debug. Tuned upward on Linux in Phase 2.
+  # 0 on Windows: worker processes there are spawned, not forked, which makes them
+  # slow to start and awkward to debug. Raise to 4 on the Linux Lightning Studio.
   dataloader_num_workers: 0
   gradient_checkpointing: false
+  # null disables early stopping. With only 2 epochs there is little to gain.
+  early_stopping_patience: null
   resume_from_checkpoint: null
+  # Fully deterministic kernels are substantially slower. Seeding alone already
+  # gives run-to-run reproducibility in practice, so this stays off by default.
+  full_determinism: false
+
+output:
+  # null -> <artifacts>/runs (git-ignored). artifacts/ is redirectable with
+  # QAS_ARTIFACTS_DIR, which is how the Lightning Studio puts runs on another volume.
+  root: null
+  # null -> <name>-<model>-<config_hash>-<UTC timestamp>, so a checkpoint can
+  # always be traced back to the exact configuration that produced it.
+  run_name: null
+  # false means a completed experiment can never be silently overwritten.
+  # Resuming is requested explicitly with `--resume` instead.
+  allow_existing: false
+  # Per-example n-best predictions, needed for qualitative error analysis.
+  save_predictions: true

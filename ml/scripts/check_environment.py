@@ -1,20 +1,20 @@
 #!/usr/bin/env python
 """Environment diagnostics for local development and the Lightning AI GPU.
 
-Reports the interpreter, operating system, key library versions and the full
-CUDA picture, then optionally runs a numerical sanity check on the resolved
-device.
+A thin command-line front end over :mod:`qa_ml.environment`, which is also what the
+training pipeline embeds in every experiment record. Sharing one implementation
+means the report a human reads and the metadata a run stores cannot disagree.
 
 Runs correctly in both target environments:
 
-- **Local Windows dev machine (CPU only)** - reports ``cuda_available: false``
-  and exits 0. A missing GPU is a fact to report, not an error.
-- **Lightning AI Studio (NVIDIA L4)** - reports the GPU name, compute
-  capability, memory and bfloat16 support.
+- **Local Windows dev machine (CPU only)** - reports ``cuda_available: false`` and
+  exits 0. A missing GPU is a fact to report, not an error.
+- **Lightning AI Studio (NVIDIA L4)** - reports the GPU name, compute capability,
+  memory and bfloat16 support.
 
-It never claims a GPU that is not there. Pass ``--require-cuda`` to turn a
-missing GPU into a non-zero exit; that form is the hard gate before expensive
-training, so a job cannot silently start a multi-day CPU run.
+It never claims a GPU that is not there. Pass ``--require-cuda`` to turn a missing
+GPU into a non-zero exit; that form is the hard gate before expensive training, so a
+job cannot silently start a multi-day CPU run.
 
 Usage:
     python ml/scripts/check_environment.py
@@ -32,13 +32,8 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import importlib
-import importlib.metadata
 import json
-import platform
-import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,214 +44,11 @@ _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-# Packages whose absence is fatal for the ML pipeline, and those that are not.
-_REQUIRED_PACKAGES = ("torch", "transformers", "tokenizers", "datasets")
-_OPTIONAL_PACKAGES = ("evaluate", "accelerate", "numpy", "yaml", "fastapi", "pydantic")
-
-_PACKAGE_TO_DISTRIBUTION = {"yaml": "PyYAML"}
-
-
-def _distribution_version(module_name: str) -> str | None:
-    """Return an installed package version without importing the package."""
-    distribution = _PACKAGE_TO_DISTRIBUTION.get(module_name, module_name)
-    try:
-        return importlib.metadata.version(distribution)
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def collect_package_versions() -> dict[str, str | None]:
-    """Collect versions of every relevant package.
-
-    Uses distribution metadata rather than importing each package, which keeps
-    the diagnostic fast and prevents an unrelated import error from masking the
-    report.
-
-    Returns:
-        Mapping of module name to version string, or ``None`` when not installed.
-    """
-    return {
-        name: _distribution_version(name)
-        for name in (*_REQUIRED_PACKAGES, *_OPTIONAL_PACKAGES)
-    }
-
-
-def collect_system_info() -> dict[str, Any]:
-    """Collect interpreter and operating system facts."""
-    return {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "python_version": platform.python_version(),
-        "python_implementation": platform.python_implementation(),
-        "python_executable": sys.executable,
-        "os": platform.system(),
-        "os_release": platform.release(),
-        "platform": platform.platform(),
-        "machine": platform.machine(),
-        "processor": platform.processor() or None,
-        "cpu_count": _cpu_count(),
-    }
-
-
-def _cpu_count() -> int | None:
-    """Return usable CPU count, preferring the scheduler-affinity view."""
-    import os
-
-    if hasattr(os, "sched_getaffinity"):  # Linux: respects cgroup/CPU pinning
-        return len(os.sched_getaffinity(0))
-    return os.cpu_count()
-
-
-def collect_torch_info() -> dict[str, Any]:
-    """Collect PyTorch build and CUDA information.
-
-    Safe on a machine with no GPU: CUDA-specific fields come back as ``None`` or
-    empty rather than raising.
-
-    Returns:
-        Mapping of torch/CUDA facts, or ``{"available": False, ...}`` if torch
-        cannot be imported at all.
-    """
-    try:
-        import torch
-    except ImportError as exc:
-        return {"available": False, "import_error": str(exc)}
-
-    from qa_torch.device import collect_cuda_diagnostics, describe_device, resolve_device
-
-    info: dict[str, Any] = {
-        "available": True,
-        "torch_version": torch.__version__,
-        "torch_cuda_compiled_version": torch.version.cuda,
-        "torch_git_version": getattr(torch.version, "git_version", None),
-    }
-    info.update(collect_cuda_diagnostics())
-
-    device = resolve_device()
-    info["resolved_device"] = str(device)
-    info["resolved_device_info"] = describe_device(device).as_dict()
-    return info
-
-
-def collect_nvidia_smi() -> dict[str, Any]:
-    """Query the NVIDIA driver via ``nvidia-smi``, if present.
-
-    This is an independent cross-check on torch. Torch may report CUDA as
-    unavailable while a driver is in fact installed (or the reverse), and knowing
-    which of the two is wrong saves considerable debugging time.
-
-    Returns:
-        Mapping with ``present`` and, when available, ``driver_version`` and a
-        list of GPUs.
-    """
-    try:
-        completed = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,driver_version,memory.total,memory.used,compute_cap",
-                "--format=csv,noheader",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-    except (FileNotFoundError, OSError):
-        return {"present": False, "reason": "nvidia-smi not found on PATH"}
-    except subprocess.TimeoutExpired:
-        return {"present": False, "reason": "nvidia-smi timed out"}
-
-    if completed.returncode != 0:
-        return {
-            "present": False,
-            "reason": f"nvidia-smi exited {completed.returncode}",
-            "stderr": completed.stderr.strip()[:400] or None,
-        }
-
-    gpus = []
-    for line in completed.stdout.strip().splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) >= 5:
-            gpus.append(
-                {
-                    "name": parts[0],
-                    "driver_version": parts[1],
-                    "memory_total": parts[2],
-                    "memory_used": parts[3],
-                    "compute_capability": parts[4],
-                }
-            )
-    return {"present": True, "gpus": gpus}
-
-
-def run_tensor_test() -> dict[str, Any]:
-    """Run a matrix-multiplication sanity check on the resolved device.
-
-    Multiplies two 512x512 matrices on the resolved device and compares against
-    the CPU result. On CUDA this exercises the driver, the runtime and kernel
-    launch, which catches a broken CUDA installation that merely *reports* as
-    available.
-
-    Returns:
-        Mapping with ``passed``, the device used, the maximum absolute deviation
-        and the tolerance applied. On failure, includes ``error``.
-    """
-    try:
-        import torch
-
-        from qa_torch.device import resolve_device
-    except ImportError as exc:
-        return {"passed": False, "error": f"torch unavailable: {exc}"}
-
-    try:
-        device = resolve_device()
-        generator = torch.Generator(device="cpu").manual_seed(0)
-        left = torch.randn(512, 512, generator=generator)
-        right = torch.randn(512, 512, generator=generator)
-
-        expected = left @ right
-        actual = (left.to(device) @ right.to(device)).cpu()
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
-        # float32 matmul reassociates differently across backends, so an exact
-        # comparison would produce false failures. This tolerance detects a
-        # genuinely broken backend without flagging benign reordering.
-        tolerance = 1e-3
-        max_deviation = (expected - actual).abs().max().item()
-        return {
-            "passed": bool(max_deviation < tolerance),
-            "device": str(device),
-            "matrix_shape": [512, 512],
-            "max_abs_deviation": float(max_deviation),
-            "tolerance": tolerance,
-        }
-    except Exception as exc:  # noqa: BLE001 - diagnostics must report, not crash
-        return {"passed": False, "error": f"{type(exc).__name__}: {exc}"}
-
-
-def build_report(*, tensor_test: bool) -> dict[str, Any]:
-    """Assemble the complete diagnostics report.
-
-    Args:
-        tensor_test: Whether to include the numerical sanity check.
-
-    Returns:
-        Nested mapping suitable for JSON serialization into an experiment record.
-    """
-    packages = collect_package_versions()
-    report: dict[str, Any] = {
-        "system": collect_system_info(),
-        "packages": packages,
-        "missing_required_packages": [
-            name for name in _REQUIRED_PACKAGES if packages.get(name) is None
-        ],
-        "torch": collect_torch_info(),
-        "nvidia_smi": collect_nvidia_smi(),
-    }
-    if tensor_test:
-        report["tensor_test"] = run_tensor_test()
-    return report
+from qa_ml.environment import (  # noqa: E402
+    OPTIONAL_PACKAGES,
+    REQUIRED_PACKAGES,
+    collect_environment,
+)
 
 
 def _format_row(label: str, value: object) -> str:
@@ -269,7 +61,7 @@ def print_report(report: dict[str, Any]) -> None:
     """Print the report as a readable table.
 
     Args:
-        report: Report produced by :func:`build_report`.
+        report: Report produced by :func:`qa_ml.environment.collect_environment`.
     """
     system = report["system"]
     packages = report["packages"]
@@ -289,10 +81,24 @@ def print_report(report: dict[str, Any]) -> None:
     print(_format_row("machine", system["machine"]))
     print(_format_row("cpu count", system["cpu_count"]))
 
+    git = report.get("git")
+    if git:
+        print("\n[ GIT PROVENANCE ]")
+        if not git.get("available"):
+            print(_format_row("git", f"unavailable ({git.get('reason')})"))
+        else:
+            print(_format_row("commit", git.get("commit_short")))
+            print(_format_row("branch", git.get("branch")))
+            dirty = git.get("dirty")
+            suffix = f" ({git.get('dirty_file_count')} modified file(s))" if dirty else ""
+            print(_format_row("working tree", ("DIRTY" if dirty else "clean") + suffix))
+            if dirty:
+                print("\n  WARNING: the working tree is modified, so a run started now")
+                print("  would NOT be reproducible from the recorded commit.")
+
     print("\n[ PACKAGES ]")
-    for name in (*_REQUIRED_PACKAGES, *_OPTIONAL_PACKAGES):
-        required = name in _REQUIRED_PACKAGES
-        marker = "*" if required else " "
+    for name in (*REQUIRED_PACKAGES, *OPTIONAL_PACKAGES):
+        marker = "*" if name in REQUIRED_PACKAGES else " "
         print(_format_row(f"{marker} {name}", packages.get(name)))
     print("\n  (* = required for the ML pipeline)")
 
@@ -394,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         Process exit code.
     """
     args = parse_args(argv)
-    report = build_report(tensor_test=args.tensor_test)
+    report = collect_environment(tensor_test=args.tensor_test)
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))

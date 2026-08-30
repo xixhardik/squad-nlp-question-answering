@@ -7,6 +7,7 @@ import pytest
 from qa_ml.config import (
     ConfigError,
     ExperimentConfig,
+    OutputConfig,
     PreprocessingConfig,
     TrainingConfig,
     load_experiment_config,
@@ -83,9 +84,21 @@ class TestShippedConfigs:
         }
         assert len(models) == len(EXPERIMENT_CONFIG_NAMES)
 
-    def test_default_precision_is_fp32(self):
-        """Mixed precision must be benchmarked on the real GPU before being enabled."""
-        assert load_experiment_config("base.yaml").training.precision == "fp32"
+    def test_default_precision_is_auto(self):
+        """`auto` resolves at runtime; it never claims bf16 on a machine lacking it."""
+        assert load_experiment_config("base.yaml").training.precision == "auto"
+
+    def test_smoke_config_pins_fp32(self):
+        """A smoke failure must be a pipeline bug, not a mixed-precision issue."""
+        assert load_experiment_config("smoke.yaml").training.precision == "fp32"
+
+    def test_every_experiment_declares_an_output_section(self):
+        for filename in EXPERIMENT_CONFIG_NAMES:
+            config = load_experiment_config(filename)
+            assert config.output.allow_existing is False, (
+                "allow_existing must default to False so a completed experiment "
+                "cannot be silently overwritten."
+            )
 
 
 class TestInheritance:
@@ -99,7 +112,7 @@ class TestInheritance:
     def test_partial_section_override_keeps_sibling_keys(self):
         """Overriding one key in a section must not wipe the rest of it."""
         config = load_experiment_config("experiment_d_deberta_v3.yaml")
-        assert config.training.batch_size == 8  # overridden
+        assert config.training.per_device_train_batch_size == 8  # overridden
         assert config.training.weight_decay == 0.01  # inherited
         assert config.training.lr_scheduler_type == "linear"  # inherited
 
@@ -238,8 +251,9 @@ class TestTrainingValidation:
         [
             {"learning_rate": 0},
             {"learning_rate": -1e-5},
-            {"batch_size": 0},
-            {"eval_batch_size": 0},
+            {"per_device_train_batch_size": 0},
+            {"per_device_eval_batch_size": 0},
+            {"early_stopping_patience": 0},
             {"gradient_accumulation_steps": 0},
             {"num_train_epochs": 0},
             {"weight_decay": -0.1},
@@ -276,12 +290,38 @@ class TestTrainingValidation:
             ).validate()
 
     def test_effective_batch_size_multiplies_accumulation(self):
-        config = TrainingConfig(batch_size=8, gradient_accumulation_steps=4)
+        config = TrainingConfig(
+            per_device_train_batch_size=8, gradient_accumulation_steps=4
+        )
         assert config.effective_batch_size == 32
 
-    @pytest.mark.parametrize("precision", ["fp32", "fp16", "bf16"])
+    @pytest.mark.parametrize("precision", ["auto", "fp32", "fp16", "bf16"])
     def test_accepts_supported_precisions(self, precision):
         TrainingConfig(precision=precision).validate()
+
+
+class TestOutputValidation:
+    """Semantic validation of :class:`qa_ml.config.OutputConfig`."""
+
+    def test_run_name_may_not_contain_a_path_separator(self):
+        """Otherwise a run could write outside the runs directory."""
+        for bad in ("nested/run", "nested\\run"):
+            with pytest.raises(ConfigError, match="single directory name"):
+                OutputConfig(run_name=bad).validate()
+
+    def test_run_name_may_not_be_blank(self):
+        with pytest.raises(ConfigError, match="non-empty string or null"):
+            OutputConfig(run_name="   ").validate()
+
+    def test_defaults_are_valid(self):
+        OutputConfig().validate()
+
+    def test_explicit_run_name_overrides_the_generated_run_id(self):
+        config = load_experiment_config(
+            "experiment_a_distilbert.yaml",
+            overrides={"output": {"run_name": "fixed-run"}},
+        )
+        assert config.run_id("20260830T120000Z") == "fixed-run"
 
 
 class TestDataValidation:
