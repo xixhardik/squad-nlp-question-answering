@@ -1,0 +1,21 @@
+# Lightning AI Studio training environment (Linux x86_64, NVIDIA L4).
+#
+#   pip install -r ml/requirements-gpu.txt
+#
+# torch==2.13.0 from PyPI resolves to the CUDA-enabled wheel on Linux
+# (cp312 manylinux_2_28_x86_64, 526.6 MB) and pulls the nvidia-* runtime
+# wheels transitively. Verified against PyPI release metadata.
+#
+# The pin is IDENTICAL to requirements-cpu.txt on purpose: the same version
+# yields a CPU build locally and a CUDA build on Linux, so local test results
+# and GPU training results stay comparable. Tokenizer offset-mapping behaviour
+# in particular MUST NOT differ between the two environments.
+#
+# CUDA availability is not assumed here - it is asserted by:
+#   python ml/scripts/check_environment.py --require-cuda
+# which is the Phase 2 hard gate.
+
+-c ../constraints.txt
+-r requirements.txt
+
+torch

@@ -1,0 +1,52 @@
+# =============================================================================
+# constraints.txt - SINGLE SOURCE OF VERSION TRUTH
+# =============================================================================
+# Every requirements file in this repository references this file with `-c`.
+# That guarantees the ML environment, the backend environment and the dev
+# environment can never resolve *different* versions of a shared package.
+#
+# Rationale for each pin is documented in docs/dependencies.md.
+# Resolved transitive graph (exact) is captured in requirements.lock.txt.
+#
+# Verified against PyPI metadata on 2026-08-29 (see docs/dependencies.md).
+# =============================================================================
+
+# --- PyTorch ------------------------------------------------------------------
+# 2.13.0 chosen because the SAME pin yields the correct build on both machines:
+#   Windows x86_64 cp312 wheel = 122.1 MB -> CPU-only  (local dev machine)
+#   Linux   x86_64 cp312 wheel = 526.6 MB -> CUDA-enabled (Lightning L4)
+# No --index-url juggling and no platform branching required.
+torch==2.13.0
+
+# --- Hugging Face stack -------------------------------------------------------
+# transformers 5.16.1 is the current 5.x release. v5 is REQUIRED by this project
+# because the `question-answering` pipeline was removed in v5, which forces the
+# explicit start/end span decoding this project is built to demonstrate.
+transformers==5.16.1
+
+# transformers 5.16.1 declares: tokenizers<0.24.0,>=0.23.1  -> pin the floor.
+tokenizers==0.23.1
+
+# datasets 5.0.1: SQuAD 1.1 is parquet-backed, so no dataset loading scripts.
+datasets==5.0.1
+
+# evaluate 0.4.6: used ONLY to cross-check our own EM/F1 implementation.
+evaluate==0.4.6
+
+# accelerate is the backend transformers.Trainer delegates to (requires torch>=2.0).
+accelerate==1.14.0
+
+# --- Configuration ------------------------------------------------------------
+PyYAML==6.0.3
+
+# --- Backend (FastAPI) --------------------------------------------------------
+# fastapi 0.141.1 declares pydantic>=2.9.0 and starlette>=0.46.0.
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+# --- Test / lint --------------------------------------------------------------
+pytest==9.1.1
+httpx==0.28.1
+ruff==0.16.5

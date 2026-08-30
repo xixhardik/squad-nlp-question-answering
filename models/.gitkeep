@@ -1,0 +1,7 @@
+# Keeps this directory in version control while its CONTENTS stay ignored.
+#
+# models/ holds the selected checkpoint pulled down from Lightning for local
+# serving, fetched with `lightning cp`. Weights are never committed to git.
+#
+# The backend locates a model via the QAS_MODEL_PATH environment variable, which
+# accepts either a directory in here or a Hugging Face repo id.

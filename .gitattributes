@@ -1,0 +1,66 @@
+# =============================================================================
+# Line-ending normalization
+# =============================================================================
+# This project is authored on Windows and trained on Linux (Lightning AI L4).
+# Without explicit rules, git's autocrlf would rewrite line endings per platform
+# and every file would show as fully modified when the same checkout is compared
+# across the two machines. That noise makes real diffs hard to review and, worse,
+# would make `git status --porcelain` unreliable as the "dirty tree" signal
+# recorded in each experiment's metadata.
+#
+# `eol=lf` stores and checks out LF everywhere, matching .editorconfig.
+
+* text=auto eol=lf
+
+# --- Explicit text types ------------------------------------------------------
+*.py      text eol=lf
+*.pyi     text eol=lf
+*.ts      text eol=lf
+*.tsx     text eol=lf
+*.js      text eol=lf
+*.mjs     text eol=lf
+*.json    text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.css     text eol=lf
+*.txt     text eol=lf
+*.cfg     text eol=lf
+*.ini     text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+.editorconfig   text eol=lf
+.env.example    text eol=lf
+
+# --- Windows-only scripts need CRLF ------------------------------------------
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+# --- Binary: never diff, never convert ---------------------------------------
+# Model artifacts are git-ignored, but these rules protect against an accidental
+# `git add -f` mangling a checkpoint through line-ending conversion.
+*.safetensors binary
+*.bin     binary
+*.pt      binary
+*.pth     binary
+*.onnx    binary
+*.ckpt    binary
+*.h5      binary
+*.gguf    binary
+*.arrow   binary
+*.parquet binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.webp    binary
+*.ico     binary
+*.pdf     binary
+*.zip     binary
+*.gz      binary
+
+# --- Generated: collapse in diffs and reviews --------------------------------
+package-lock.json    linguist-generated=true
+requirements.lock.txt linguist-generated=true

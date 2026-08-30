@@ -1,0 +1,21 @@
+# =============================================================================
+# EXPERIMENT A - DistilBERT baseline
+# =============================================================================
+# Role: establish the baseline and calibrate the GPU budget.
+#
+# 6 transformer layers, 66,985,530 parameters (verified from Hub safetensors
+# metadata), WordPiece tokenizer with a 30,522 token vocabulary.
+#
+# Runs first because it is the cheapest of the four. Its measured throughput is
+# what the cost forecast for Experiments B, C and D is built from.
+# =============================================================================
+
+extends: base.yaml
+
+name: exp-a-distilbert
+description: >-
+  DistilBERT baseline for extractive QA on SQuAD 1.1. Cheapest of the four
+  candidates; also supplies the throughput calibration used to forecast the
+  remaining experiments.
+
+model_name: distilbert-base-uncased

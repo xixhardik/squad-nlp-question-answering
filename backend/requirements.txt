@@ -1,0 +1,19 @@
+# FastAPI inference backend.
+#
+#   pip install -r backend/requirements.txt
+#
+# Phase 1 scope: HTTP surface only (GET /health). No model, no weights.
+#
+# NOTE: torch + transformers are intentionally NOT listed yet. They are added
+# when POST /predict is implemented (a later phase), and they will be pulled
+# from ../constraints.txt so the backend can never drift to a different
+# transformers/tokenizers version than the one used for training. A tokenizer
+# version mismatch between training and serving would silently change offset
+# mappings and invalidate measured metrics.
+
+-c ../constraints.txt
+
+fastapi
+uvicorn
+pydantic
+pydantic-settings

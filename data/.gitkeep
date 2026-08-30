@@ -1,0 +1,8 @@
+# Keeps this directory in version control while its CONTENTS stay ignored.
+#
+# data/ holds the Hugging Face datasets cache. SQuAD 1.1 is downloaded here by
+# the datasets library and is never committed: a copy in git is a copy that can
+# silently diverge from the canonical dataset, after which a metric can no longer
+# be traced to a known revision of known data.
+#
+# Override the location with HF_HOME. See docs/dataset-policy.md.

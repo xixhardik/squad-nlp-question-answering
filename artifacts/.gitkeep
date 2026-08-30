@@ -1,0 +1,10 @@
+# Keeps this directory in version control while its CONTENTS stay ignored.
+#
+# artifacts/ holds machine-local experiment output:
+#   runs/<run_id>/checkpoint/    model weights   (large, never committed)
+#   runs/<run_id>/metrics.json   measured results
+#   runs/<run_id>/env.json       captured environment
+#   cache/                       tokenized feature caches
+#
+# Checkpoints are registered with `lightning model` and the small metrics JSON is
+# copied into reports/ and committed there. See docs/lightning-workflow.md.

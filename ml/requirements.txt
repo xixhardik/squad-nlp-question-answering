@@ -1,0 +1,17 @@
+# ML / training dependencies (platform-independent core).
+#
+# Do NOT install this file directly - it does not pin a PyTorch build.
+# Use one of:
+#   local dev (CPU)  : pip install -r ml/requirements-cpu.txt
+#   Lightning L4 GPU : pip install -r ml/requirements-gpu.txt
+#
+# Versions come from ../constraints.txt (single source of truth).
+
+-c ../constraints.txt
+
+transformers
+tokenizers
+datasets
+evaluate
+accelerate
+PyYAML

@@ -1,0 +1,26 @@
+# =============================================================================
+# EXPERIMENT B - BERT-base
+# =============================================================================
+# Role: clean depth ablation against Experiment A.
+#
+# 12 transformer layers, 110,106,428 parameters (verified from Hub safetensors
+# metadata), and the SAME WordPiece tokenizer and 30,522 token vocabulary as
+# DistilBERT.
+#
+# Because the tokenizer is identical to Experiment A, A -> B isolates encoder
+# depth with tokenization held constant. That makes it the only genuinely clean
+# pairwise comparison in the matrix.
+#
+# Tokenized feature cache may be shareable with Experiment A for the same reason
+# (DistilBERT simply ignores token_type_ids, which is handled at collation).
+# To be confirmed by measurement, not assumed.
+# =============================================================================
+
+extends: base.yaml
+
+name: exp-b-bert-base
+description: >-
+  BERT-base-uncased for extractive QA on SQuAD 1.1. Same tokenizer and vocabulary
+  as Experiment A, so the comparison isolates encoder depth (6 vs 12 layers).
+
+model_name: bert-base-uncased

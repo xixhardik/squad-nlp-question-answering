@@ -1,0 +1,14 @@
+# Local development environment (Windows / macOS / Linux, CPU only).
+#
+#   pip install -r ml/requirements-cpu.txt
+#
+# torch==2.13.0 from PyPI resolves to the CPU-only wheel on Windows
+# (cp312 win_amd64, 122.1 MB). Verified against PyPI release metadata.
+#
+# This machine has no NVIDIA GPU (nvidia-smi absent), so a CUDA build would be
+# dead weight. Training happens on Lightning AI - see docs/lightning-workflow.md.
+
+-c ../constraints.txt
+-r requirements.txt
+
+torch

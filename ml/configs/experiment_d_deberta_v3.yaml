@@ -1,0 +1,45 @@
+# =============================================================================
+# EXPERIMENT D - DeBERTa-v3-base  (OPTIONAL, BUDGET-GATED)
+# =============================================================================
+# Role: strongest candidate. Runs only if the measured cost forecast fits in the
+# remaining GPU allowance after Experiments A, B and C.
+#
+# 12 transformer layers, hidden size 768, SentencePiece tokenizer with a 128,100
+# token vocabulary (values read from the published config.json).
+#
+# Parameter count is NOT stated here: microsoft/deberta-v3-base publishes no
+# safetensors metadata on the Hub, so the total must be measured locally before
+# it is reported. What is known from config.json is that the embedding matrix
+# alone is 128,100 x 768 = 98,380,800 parameters, which by itself exceeds
+# DistilBERT's entire parameter count.
+#
+# HIGHEST-RISK EXPERIMENT. Measured on this tokenizer, the recovered character
+# span for the answer 'Brazil' was (289, 296) -> ' Brazil' instead of
+# (290, 296) -> 'Brazil': SentencePiece offset mappings INCLUDE the preceding
+# whitespace. SQuAD normalization strips whitespace, so EM and F1 would be
+# unaffected and the defect would be invisible in the metrics, surfacing only as
+# an answer highlight rendered one character early in the UI.
+# qa_core.spans.tighten_char_span exists for exactly this reason and is applied
+# to every recovered span.
+#
+# Also the slowest per step: disentangled attention costs more than standard
+# self-attention, on top of the larger embedding table.
+# =============================================================================
+
+extends: base.yaml
+
+name: exp-d-deberta-v3
+description: >-
+  DeBERTa-v3-base for extractive QA on SQuAD 1.1. Optional and budget-gated.
+  Strongest candidate but the most expensive per step and the highest
+  preprocessing risk (SentencePiece offset mappings include leading whitespace).
+
+model_name: microsoft/deberta-v3-base
+
+training:
+  # Larger embedding table and disentangled attention raise activation memory.
+  # Halved batch size with matching gradient accumulation keeps the effective
+  # batch size equal to the other experiments, so the comparison stays fair.
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  eval_batch_size: 32

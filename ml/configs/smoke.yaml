@@ -1,0 +1,35 @@
+# =============================================================================
+# smoke.yaml - tiny end-to-end pipeline test. NOT an experiment.
+# =============================================================================
+# Purpose: prove the whole path executes - preprocessing, training step,
+# checkpoint save/reload, evaluation, span decoding - before any GPU time is
+# committed to a real run.
+#
+# The EM/F1 this produces are meaningless and must never be reported. Only the
+# fact that every stage completes is under test.
+# =============================================================================
+
+extends: base.yaml
+
+name: smoke
+description: >-
+  Tiny-subset smoke test of the full training and evaluation path. Metrics from
+  this config are not results and must not appear in any report.
+
+model_name: distilbert-base-uncased
+
+data:
+  # Small enough to finish in minutes on CPU, large enough that several examples
+  # have contexts long enough to exercise sliding-window overflow.
+  max_train_samples: 256
+  max_eval_samples: 128
+
+training:
+  num_train_epochs: 1
+  batch_size: 8
+  eval_batch_size: 16
+  logging_steps: 5
+  save_total_limit: 1
+  # Warmup over a handful of steps is meaningless; keep the schedule simple so a
+  # failure points at the pipeline rather than the LR schedule.
+  warmup_ratio: 0.0

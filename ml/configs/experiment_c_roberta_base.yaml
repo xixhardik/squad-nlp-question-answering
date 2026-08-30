@@ -1,0 +1,30 @@
+# =============================================================================
+# EXPERIMENT C - RoBERTa-base
+# =============================================================================
+# Role: different pretraining recipe AND a different tokenizer family.
+#
+# 12 transformer layers, 124,697,947 parameters (verified from Hub safetensors
+# metadata), byte-level BPE tokenizer with a 50,265 token vocabulary,
+# max_position_embeddings = 514.
+#
+# ACKNOWLEDGED CONFOUND: B -> C changes the pretraining corpus/objective and the
+# tokenizer at the same time, so any difference cannot be attributed to one of
+# them alone. Recorded in docs/ rather than presented as a clean ablation.
+#
+# This experiment also stress-tests qa_core against a non-WordPiece tokenizer.
+# Two measured behaviours it must survive:
+#   * decode() yields ' Brazil' (leading space) while slicing the raw context at
+#     the same offsets yields 'Brazil'. Answer text must come from the slice.
+#   * RoBERTa emits TWO separator tokens (</s></s>), so sequence_ids() must be
+#     used to find context tokens; any hard-coded [SEP] index arithmetic breaks.
+# =============================================================================
+
+extends: base.yaml
+
+name: exp-c-roberta-base
+description: >-
+  RoBERTa-base for extractive QA on SQuAD 1.1. Changes both the pretraining
+  recipe and the tokenizer family (byte-level BPE), which also validates that the
+  shared preprocessing generalizes beyond WordPiece.
+
+model_name: roberta-base

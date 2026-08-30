@@ -1,0 +1,11 @@
+# Development / test tooling.
+#
+#   pip install -r requirements-dev.txt
+#
+# Installed in addition to ml/requirements-cpu.txt and backend/requirements.txt.
+
+-c constraints.txt
+
+pytest
+httpx    # required by fastapi.testclient (starlette TestClient)
+ruff
