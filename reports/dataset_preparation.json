@@ -1,0 +1,115 @@
+{
+  "config": "experiment_d_deberta_v3.yaml",
+  "dataset_name": "rajpurkar/squad",
+  "dataset_version": "main",
+  "model_name": "microsoft/deberta-v3-base",
+  "max_seq_length": 384,
+  "doc_stride": 128,
+  "sample_capped": false,
+  "max_train_samples": null,
+  "max_eval_samples": null,
+  "splits": {
+    "train": {
+      "summary": {
+        "split": "train",
+        "num_examples": 87599,
+        "num_titles": 442,
+        "context_chars": {
+          "min": 151,
+          "mean": 754.36,
+          "max": 3706
+        },
+        "question_chars": {
+          "min": 1,
+          "mean": 59.57,
+          "max": 25651
+        },
+        "answer_chars": {
+          "min": 1,
+          "mean": 20.15,
+          "max": 239
+        },
+        "answers_per_example": {
+          "min": 1,
+          "mean": 1.0,
+          "max": 1
+        }
+      },
+      "offset_verification": {
+        "checked": 2000,
+        "exact_matches": 2000,
+        "whitespace_only_mismatches": 0,
+        "mismatches": 0,
+        "examples_with_no_answer": 0,
+        "exact_match_rate": 1.0,
+        "usable_rate": 1.0
+      }
+    },
+    "validation": {
+      "summary": {
+        "split": "validation",
+        "num_examples": 10570,
+        "num_titles": 48,
+        "context_chars": {
+          "min": 157,
+          "mean": 778.98,
+          "max": 4063
+        },
+        "question_chars": {
+          "min": 12,
+          "mean": 60.01,
+          "max": 197
+        },
+        "answer_chars": {
+          "min": 1,
+          "mean": 19.38,
+          "max": 160
+        },
+        "answers_per_example": {
+          "min": 1,
+          "mean": 3.29,
+          "max": 6
+        }
+      },
+      "offset_verification": {
+        "checked": 2000,
+        "exact_matches": 2000,
+        "whitespace_only_mismatches": 0,
+        "mismatches": 0,
+        "examples_with_no_answer": 0,
+        "exact_match_rate": 1.0,
+        "usable_rate": 1.0
+      }
+    }
+  },
+  "features": {
+    "train": {
+      "num_examples": 87599,
+      "num_features": 88316,
+      "features_per_example": 1.0082,
+      "alignment": {
+        "total_features": 88316,
+        "aligned": 87734,
+        "answer_outside_window": 582,
+        "no_context_tokens": 0,
+        "degenerate_answer": 0,
+        "examples_with_no_aligned_feature": 0,
+        "aligned_fraction": 0.99341
+      }
+    },
+    "validation": {
+      "num_examples": 10570,
+      "num_features": 10756,
+      "features_per_example": 1.0176,
+      "alignment": {
+        "total_features": 10756,
+        "aligned": 10610,
+        "answer_outside_window": 146,
+        "no_context_tokens": 0,
+        "degenerate_answer": 0,
+        "examples_with_no_aligned_feature": 0,
+        "aligned_fraction": 0.986426
+      }
+    }
+  }
+}

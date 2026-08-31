@@ -96,6 +96,41 @@ This project's own config vocabulary keeps `evaluation_strategy` (see
 boundary by an adapter, so a library rename cannot silently invalidate committed
 experiment records. This is documented in `src/qa_ml/config.py`.
 
+## Tokenizer backends
+
+| Package | Pin | Why |
+|---|---|---|
+| `sentencepiece` | `0.2.1` | Converts `spm.model` into a fast tokenizer for `microsoft/deberta-v3-base`. |
+| `protobuf` | `7.34.1` | The SentencePiece model is a protobuf; the converter parses it. |
+
+These are needed by **Experiment D only**, and the reason is a property of the
+model repository rather than a preference. `microsoft/deberta-v3-base` publishes
+`spm.model` and **no `tokenizer.json`** (verified against the Hub file manifest:
+`.gitattributes`, `README.md`, `config.json`, `pytorch_model.bin`, `rust_model.ot`,
+`spm.model`, `tf_model.h5`, `tokenizer_config.json`). So the fast tokenizer has to
+be built from the SentencePiece model at load time, and that conversion needs both
+packages.
+
+Verified by execution. With either package made unimportable,
+`AutoTokenizer.from_pretrained("microsoft/deberta-v3-base", use_fast=True)` logs
+
+```
+Could not extract SentencePiece model from .../spm.model ... Falling back to TikToken extractor.
+```
+
+and then fails with ``ValueError: `tiktoken` is required to read a `tiktoken` file``.
+`qa_torch.loader.load_tokenizer` surfaces that as a `ModelLoadError`, so it is a
+clean failure rather than a silent one — but it is still a failed run, and the
+pipeline requires a *fast* tokenizer because offset mappings come only from the
+Rust backend.
+
+Experiments A and B (WordPiece) and C (byte-level BPE) all use repositories that
+ship a `tokenizer.json`, which is why this gap did not surface until D.
+
+Both packages are listed in `ml/requirements.txt` rather than
+`ml/requirements-gpu.txt`, so the local CPU environment can build DeBERTa features
+and run alignment tests without a GPU.
+
 ## Backend
 
 | Package | Pin | Why |

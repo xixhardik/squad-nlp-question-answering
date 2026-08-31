@@ -36,6 +36,21 @@ evaluate==0.4.6
 # accelerate is the backend transformers.Trainer delegates to (requires torch>=2.0).
 accelerate==1.14.0
 
+# --- Tokenizer backends -------------------------------------------------------
+# Required by microsoft/deberta-v3-base (Experiment D), NOT by A/B/C.
+#
+# That repository ships a SentencePiece model (spm.model) and NO tokenizer.json,
+# so the fast tokenizer must be converted from spm.model at load time. Verified by
+# execution: with either package absent, AutoTokenizer.from_pretrained(...,
+# use_fast=True) reports "Could not extract SentencePiece model ... Falling back to
+# TikToken extractor" and then fails with "`tiktoken` is required to read a
+# `tiktoken` file".
+#
+# Experiments A and B use WordPiece and C uses byte-level BPE, all of which ship a
+# tokenizer.json, which is why this gap only surfaced at Experiment D.
+sentencepiece==0.2.1
+protobuf==7.34.1
+
 # --- Configuration ------------------------------------------------------------
 PyYAML==6.0.3
 

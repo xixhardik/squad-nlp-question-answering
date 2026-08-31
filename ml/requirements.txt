@@ -15,3 +15,9 @@ datasets
 evaluate
 accelerate
 PyYAML
+
+# Tokenizer backends. microsoft/deberta-v3-base (Experiment D) ships only a
+# SentencePiece model and no tokenizer.json, so the fast tokenizer is converted
+# from spm.model at load time and that conversion needs both of these.
+sentencepiece
+protobuf
