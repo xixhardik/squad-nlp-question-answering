@@ -14,6 +14,10 @@ Marked ``network`` because tokenizer files are fetched from the Hub on first run
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from qa_core.alignment import AlignmentStatus
@@ -553,3 +557,145 @@ class TestContextBudget:
     def test_empty_context_yields_a_single_window(self, tokenizers):
         builder = _builder(tokenizers["bert-base-uncased"])
         assert builder.window_char_ranges("What?", "") == [(0, 0)]
+
+
+class TestNoOverLengthFeatureReachesTheModel:
+    """Regression guard for the "718 > 512" tokenizer warning seen in training logs.
+
+    ``window_char_ranges`` deliberately tokenizes the **whole** context with no
+    truncation, because it needs every token's character offset to tile the passage.
+    For a context longer than the tokenizer's ``model_max_length`` (512 for BERT),
+    transformers logs:
+
+        Token indices sequence length is longer than the specified maximum sequence
+        length for this model (N > 512). Running this sequence through the model will
+        result in indexing errors.
+
+    The warning is true in general and false here: that encoding is never fed to a
+    model. These tests pin the property the warning is really about -- that nothing
+    over-length ever reaches the model -- so the warning can be suppressed at that one
+    call site without hiding a genuine defect.
+    """
+
+    @staticmethod
+    def _long_context(sentences: int) -> str:
+        return " ".join(
+            f"Sentence number {index} describes an event in recorded football history."
+            for index in range(sentences)
+        )
+
+    @pytest.mark.parametrize("model_name", TOKENIZER_FAMILIES)
+    @pytest.mark.parametrize(("max_seq_length", "doc_stride"), [(384, 128), (256, 64), (128, 32)])
+    def test_no_window_exceeds_max_seq_length(
+        self, tokenizers, model_name, max_seq_length, doc_stride
+    ):
+        tokenizer = tokenizers[model_name]
+        context = self._long_context(70)
+        # Confirm the premise: this context really is longer than model_max_length.
+        raw_tokens = len(
+            tokenizer(context, add_special_tokens=False, verbose=False)["input_ids"]
+        )
+        assert raw_tokens > tokenizer.model_max_length, (
+            f"{model_name}: fixture context is only {raw_tokens} tokens, so it does not "
+            "exercise the over-length path"
+        )
+
+        builder = _builder(
+            tokenizer, max_seq_length=max_seq_length, doc_stride=doc_stride
+        )
+        windows = builder.encode_windows("How often is the World Cup organised?", context)
+
+        for index, window in enumerate(windows):
+            length = len(window.model_inputs["input_ids"])
+            assert length <= max_seq_length, (
+                f"{model_name}: window {index} has {length} tokens, over the "
+                f"{max_seq_length} limit -- this WOULD cause indexing errors"
+            )
+            assert len(window.offsets) == length
+            assert len(window.context_mask) == length
+
+    @pytest.mark.parametrize("model_name", TOKENIZER_FAMILIES)
+    def test_train_feature_labels_stay_within_bounds(self, tokenizers, model_name):
+        """Out-of-range start/end positions are what an over-length feature would cause."""
+        context = self._long_context(70)
+        answer = "Sentence number 69"
+        batch = {
+            "id": ["long-1"],
+            "title": ["T"],
+            "context": [context],
+            "question": ["Which sentence is last?"],
+            "answers": [{"text": [answer], "answer_start": [context.index(answer)]}],
+        }
+        builder = _builder(tokenizers[model_name], max_seq_length=384, doc_stride=128)
+        features = builder.build_train_features(batch)
+
+        for index, input_ids in enumerate(features["input_ids"]):
+            assert len(input_ids) <= 384
+            start = features["start_positions"][index]
+            end = features["end_positions"][index]
+            assert 0 <= start < len(input_ids), f"start {start} out of range"
+            assert 0 <= end < len(input_ids), f"end {end} out of range"
+
+    @pytest.mark.parametrize("model_name", TOKENIZER_FAMILIES)
+    def test_eval_features_stay_within_bounds(self, tokenizers, model_name):
+        context = self._long_context(70)
+        batch = {
+            "id": ["long-1"],
+            "title": ["T"],
+            "context": [context],
+            "question": ["Which sentence is last?"],
+        }
+        builder = _builder(tokenizers[model_name], max_seq_length=384, doc_stride=128)
+        features = builder.build_eval_features(batch)
+        for index, input_ids in enumerate(features["input_ids"]):
+            assert len(input_ids) <= 384
+            assert len(features["offset_mapping"][index]) == len(input_ids)
+            assert len(features["context_mask"][index]) == len(input_ids)
+
+    def test_the_length_warning_is_not_emitted_by_the_pipeline(self):
+        """Run the pipeline in a clean interpreter and assert the log stays quiet.
+
+        A subprocess is required: transformers emits this warning only **once per
+        tokenizer instance**, so any in-process check is contaminated by whichever
+        test tokenized a long context first.
+        """
+        code = textwrap.dedent(
+            """
+            from qa_torch.features import SquadFeatureBuilder
+            from qa_torch.loader import load_tokenizer
+
+            tokenizer = load_tokenizer("bert-base-uncased")
+            context = " ".join(
+                f"Sentence number {i} describes an event in recorded football history."
+                for i in range(70)
+            )
+            assert len(tokenizer(context, add_special_tokens=False,
+                                 verbose=False)["input_ids"]) > 512
+
+            builder = SquadFeatureBuilder(
+                tokenizer, max_seq_length=384, doc_stride=128
+            )
+            answer = "Sentence number 69"
+            builder.build_train_features({
+                "id": ["x"], "title": ["T"], "context": [context],
+                "question": ["Which sentence is last?"],
+                "answers": [{"text": [answer], "answer_start": [context.index(answer)]}],
+            })
+            print("PIPELINE_OK")
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        combined = result.stdout + result.stderr
+        assert "PIPELINE_OK" in combined, f"pipeline failed:\n{combined}"
+        assert "longer than the specified maximum sequence length" not in combined, (
+            "the over-length tokenizer warning reappeared. Either a call site lost its "
+            "verbose=False, or a new un-truncated tokenizer call was added. Confirm no "
+            "over-length feature reaches the model before simply re-suppressing it.\n"
+            f"output:\n{combined}"
+        )

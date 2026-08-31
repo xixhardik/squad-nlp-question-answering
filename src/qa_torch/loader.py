@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from transformers import (
@@ -32,17 +33,23 @@ from qa_torch.features import TokenizerNotFastError
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CheckpointIntegrityError",
     "ModelBundle",
     "ModelLoadError",
     "count_parameters",
     "describe_model",
     "load_qa_model",
     "load_tokenizer",
+    "verify_checkpoint_integrity",
 ]
 
 
 class ModelLoadError(RuntimeError):
     """Raised when a tokenizer or model cannot be loaded."""
+
+
+class CheckpointIntegrityError(RuntimeError):
+    """Raised when a saved checkpoint does not reload to identical parameters."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,3 +269,120 @@ def load_model_bundle(
         model_name=model_name,
         num_parameters=count_parameters(model),
     )
+
+
+def verify_checkpoint_integrity(
+    model: PreTrainedModel,
+    checkpoint_path: str | Path,
+    *,
+    strict: bool = True,
+) -> dict[str, object]:
+    """Reload a just-saved checkpoint and confirm every parameter survived.
+
+    Why this exists
+    ---------------
+    Some architectures store parameters under legacy names. ``bert-base-uncased``
+    ships its LayerNorm parameters as ``LayerNorm.gamma`` / ``LayerNorm.beta``
+    rather than ``.weight`` / ``.bias``, a holdover from the original TensorFlow
+    release. ``transformers`` maps those names in **both** directions, so
+    ``save_pretrained`` writes ``.gamma``/``.beta`` back out and
+    ``from_pretrained`` maps them in again. That round trip is lossless, and this
+    project's loader always uses ``from_pretrained``.
+
+    A load path that bypasses that mapping is not lossless. Measured on
+    ``transformers`` 5.16.1 with a saved BERT checkpoint, a raw
+    ``load_state_dict(strict=False)`` reports **50 missing** ``LayerNorm.weight``/
+    ``.bias`` keys and **50 unexpected** ``.gamma``/``.beta`` keys, and silently
+    leaves those 50 tensors at whatever the model already held. Nothing crashes;
+    the model is simply not the one that was saved.
+
+    This check turns that class of failure from silent into loud. It costs one
+    extra model load and is worth it: a corrupted checkpoint reported as a
+    successful experiment is the worst possible outcome for a results-driven
+    project.
+
+    Args:
+        model: The in-memory model whose weights were just saved.
+        checkpoint_path: Directory the checkpoint was written to.
+        strict: Raise on any drift. When ``False``, the drift is reported in the
+            return value and logged as an error but no exception is raised.
+
+    Returns:
+        A JSON-serializable report with the parameter count, the number of drifted
+        tensors, the largest absolute difference, how many LayerNorm parameters sit
+        at their default values, and an ``ok`` flag.
+
+    Raises:
+        CheckpointIntegrityError: If ``strict`` and any parameter differs, or if the
+            reloaded key set does not match.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    reference = {name: tensor.detach().cpu() for name, tensor in model.named_parameters()}
+
+    # Load on CPU so this never competes with training for device memory.
+    reloaded = AutoModelForQuestionAnswering.from_pretrained(str(checkpoint_path))
+    actual = {name: tensor.detach().cpu() for name, tensor in reloaded.named_parameters()}
+
+    missing = sorted(set(reference) - set(actual))
+    extra = sorted(set(actual) - set(reference))
+
+    drifted: list[str] = []
+    max_delta = 0.0
+    for name, expected in reference.items():
+        found = actual.get(name)
+        if found is None or found.shape != expected.shape:
+            drifted.append(name)
+            continue
+        if not torch.equal(found, expected):
+            drifted.append(name)
+            delta = (found.float() - expected.float()).abs().max().item()
+            max_delta = max(max_delta, delta)
+
+    # A LayerNorm weight of exactly all-ones (or bias of all-zeros) is the signature
+    # of a parameter that was reinitialised rather than loaded.
+    default_layernorm = [
+        name
+        for name, tensor in actual.items()
+        if "LayerNorm" in name
+        and (
+            (name.endswith(".weight") and torch.allclose(tensor, torch.ones_like(tensor)))
+            or (name.endswith(".bias") and torch.allclose(tensor, torch.zeros_like(tensor)))
+        )
+    ]
+
+    report: dict[str, object] = {
+        "checkpoint_path": str(checkpoint_path),
+        "num_parameters_checked": len(reference),
+        "num_drifted": len(drifted),
+        "max_abs_delta": max_delta,
+        "missing_after_reload": missing,
+        "unexpected_after_reload": extra,
+        "layernorm_at_default_values": len(default_layernorm),
+        "ok": not drifted and not missing and not extra,
+    }
+
+    del reloaded
+
+    if report["ok"]:
+        logger.info(
+            "Checkpoint integrity verified: %d parameters reload bit-identically from %s",
+            len(reference),
+            checkpoint_path,
+        )
+        return report
+
+    detail = (
+        f"{len(drifted)} parameter(s) differ, {len(missing)} missing, {len(extra)} unexpected"
+    )
+    message = (
+        f"Checkpoint at {checkpoint_path} does NOT reload to the model that was saved: "
+        f"{detail} (max abs delta {max_delta:.3e}).\n"
+        f"First drifted: {drifted[:8]}\n"
+        "This means the saved weights are not the trained weights. Do not report "
+        "metrics from this checkpoint. Likely causes: a save/load path that bypasses "
+        "from_pretrained's key-conversion mapping, or a partially written file."
+    )
+    if strict:
+        raise CheckpointIntegrityError(message)
+    logger.error(message)
+    return report

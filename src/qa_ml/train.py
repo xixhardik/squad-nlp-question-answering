@@ -67,7 +67,12 @@ from qa_torch.device import (
     resolve_precision,
 )
 from qa_torch.features import SquadFeatureBuilder
-from qa_torch.loader import describe_model, load_qa_model, load_tokenizer
+from qa_torch.loader import (
+    describe_model,
+    load_qa_model,
+    load_tokenizer,
+    verify_checkpoint_integrity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -336,11 +341,30 @@ def run_training(
                 torch.cuda.max_memory_allocated() / (1024**3), 3
             )
 
+        # Which checkpoint the Trainer selected, recorded so the effect of
+        # load_best_model_at_end is auditable after the fact rather than assumed.
+        record.training["load_best_model_at_end"] = config.training.load_best_model_at_end
+        record.training["best_model_checkpoint"] = getattr(
+            trainer.state, "best_model_checkpoint", None
+        )
+        record.training["best_metric"] = getattr(trainer.state, "best_metric", None)
+        record.training["best_global_step"] = getattr(trainer.state, "best_global_step", None)
+        record.training["final_global_step"] = getattr(trainer.state, "global_step", None)
+
         checkpoint_dir = run_dir / "model"
         trainer.save_model(str(checkpoint_dir))
         tokenizer.save_pretrained(str(checkpoint_dir))
         record.checkpoint_path = str(checkpoint_dir)
         logger.info("Saved model and tokenizer to %s", checkpoint_dir)
+
+        # Confirm the artifact on disk really is the model we just trained. Some
+        # architectures store parameters under legacy names (BERT writes LayerNorm
+        # as .gamma/.beta), and a load path that skips the key-conversion mapping
+        # silently leaves those tensors unloaded. Cheap insurance against reporting
+        # metrics for a checkpoint that is not the trained model.
+        record.training["checkpoint_integrity"] = verify_checkpoint_integrity(
+            trainer.model, checkpoint_dir
+        )
 
         # Final evaluation, with the cross-check if requested. Run explicitly rather
         # than reusing the last in-training eval so the recorded numbers unambiguously

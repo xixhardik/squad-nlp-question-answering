@@ -552,7 +552,85 @@ always traceable to the configuration that produced it.
 
 ---
 
-## 11. Known limitations
+## 11. Two warnings you will see in training logs
+
+Both were audited. Neither is a defect, but the second one guards a real hazard.
+
+### "Token indices sequence length is longer than the specified maximum sequence length (718 > 512)"
+
+**Origin:** `SquadFeatureBuilder.window_char_ranges()`, the deliberate full-context
+tokenization that has no `truncation` or `max_length` because it needs every token's
+character offset in order to tile the passage.
+
+**Attribution, established by running each call site in an isolated process** (the
+warning fires only once per tokenizer instance, so in-process checks are contaminated):
+
+| call site | warns |
+|---|---|
+| `window_char_ranges()` | **yes** |
+| `encode_windows()` — the path that feeds the model | no |
+| `_question_token_count()` | no |
+
+**Why it is harmless:** the encoding it complains about is never given to a model. It
+exists only to read `offset_mapping`. Every tensor that reaches the model comes from
+`encode_windows`, with `truncation="only_second", max_length=max_seq_length`. Measured
+on the 25 longest real SQuAD validation contexts (up to 789 tokens): 75 windows
+produced, maximum feature length exactly 384, never over, and all `start_positions` /
+`end_positions` in range.
+
+**How often it triggers:** on the SQuAD validation split, context token lengths run
+min 30 / mean 161.0 / max 789. **49 contexts (0.46%) exceed 512 tokens** and trigger
+the warning; **161 (1.52%) exceed 384** and therefore need more than one window.
+
+**Fix:** `verbose=False` at that one call site, with a comment explaining why.
+Verified to change the returned `input_ids` and `offset_mapping` not at all.
+`tests/test_features.py::TestNoOverLengthFeatureReachesTheModel` pins both that no
+feature exceeds `max_seq_length` and that the warning does not return.
+
+### BERT reload: missing `LayerNorm.weight`/`.bias`, unexpected `LayerNorm.gamma`/`.beta`
+
+**Origin:** `bert-base-uncased` publishes its LayerNorm parameters under the legacy
+TensorFlow names. The Hub checkpoint contains `LayerNorm.gamma` and `LayerNorm.beta`
+and **no** `LayerNorm.weight` at all.
+
+`transformers` maps those names in **both** directions, and the naming follows the
+checkpoint's history rather than the architecture:
+
+- `from_pretrained` maps `.gamma` → `.weight` on load
+- `save_pretrained` writes `.gamma`/`.beta` back out for a model that came from such a
+  checkpoint (a model built from `BertConfig` saves modern names instead)
+
+**Verified: nothing is lost through the path this project uses.**
+
+| load path | missing LayerNorm | unexpected `.gamma`/`.beta` | LayerNorm restored |
+|---|---:|---:|---|
+| `from_pretrained` (used by `load_qa_model`) | 0 | 0 | **yes** |
+| raw `load_state_dict(strict=False)` | 50 | 50 | **no** |
+
+Loading `bert-base-uncased` reports only `qa_outputs.weight`/`.bias` as missing — the
+expected fresh QA head — and no LayerNorm keys, from either the `.safetensors` or the
+`.bin` file. The loaded `bert.embeddings.LayerNorm.weight` has mean 0.849, not all
+ones, and matches the raw checkpoint tensor exactly.
+
+A full save/reload round trip with every parameter perturbed first showed **0 of 199
+parameters drifted, 0 LayerNorm at default values, and bit-identical logits**.
+
+**The real hazard:** a load path that bypasses the mapping silently leaves those 50
+tensors unloaded. Nothing crashes; the model simply is not the one that was saved.
+`Trainer._load_best_model` contains both `from_pretrained` and `load_state_dict`
+branches, which is the likely source of the warning when
+`load_best_model_at_end: true`.
+
+**Fix:** `qa_torch.loader.verify_checkpoint_integrity` runs after every
+`trainer.save_model`, reloads the checkpoint and raises unless all parameters are
+bit-identical. Each run also records `best_model_checkpoint`, `best_metric`,
+`best_global_step` and `final_global_step`, so the effect of best-model restoration is
+auditable from the experiment record instead of assumed. Covered by
+`tests/test_loader.py`.
+
+---
+
+## 12. Known limitations
 
 1. **`microsoft/deberta-v3-base` (Experiment D) cannot be loaded** in this environment:
    its tokenizer requires `sentencepiece` or `tiktoken`. Experiment D is optional and

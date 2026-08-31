@@ -33,6 +33,7 @@ from qa_torch.features import (
 )
 from qa_torch.inference import ExtractiveQAEngine, PredictionResult
 from qa_torch.loader import (
+    CheckpointIntegrityError,
     ModelBundle,
     ModelLoadError,
     count_parameters,
@@ -40,12 +41,14 @@ from qa_torch.loader import (
     load_model_bundle,
     load_qa_model,
     load_tokenizer,
+    verify_checkpoint_integrity,
 )
 
 __version__ = "0.2.0"
 
 __all__ = [
     "AlignmentReport",
+    "CheckpointIntegrityError",
     "DeviceInfo",
     "DeviceUnavailableError",
     "EncodedWindow",
@@ -71,4 +74,5 @@ __all__ = [
     "require_cuda",
     "resolve_device",
     "resolve_precision",
+    "verify_checkpoint_integrity",
 ]

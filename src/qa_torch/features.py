@@ -351,8 +351,15 @@ class SquadFeatureBuilder:
         return prepared
 
     def _question_token_count(self, question: str) -> int:
-        """Number of tokens the prepared question occupies, excluding specials."""
-        return len(self.tokenizer(question, add_special_tokens=False)["input_ids"])
+        """Number of tokens the prepared question occupies, excluding specials.
+
+        ``verbose=False`` for the same reason as in :meth:`window_char_ranges`: this
+        is a measurement, not a model input. A pathologically long question would
+        otherwise emit a misleading length warning.
+        """
+        return len(
+            self.tokenizer(question, add_special_tokens=False, verbose=False)["input_ids"]
+        )
 
     # -- explicit windowing --------------------------------------------------
 
@@ -395,8 +402,24 @@ class SquadFeatureBuilder:
         Raises:
             QuestionTooLongError: If no context tokens would fit in a window.
         """
+        # Deliberately NO truncation and NO max_length: the whole point is to see
+        # every context token so the window ranges below can tile the full passage.
+        #
+        # verbose=False suppresses transformers' "Token indices sequence length is
+        # longer than the specified maximum sequence length for this model
+        # (N > 512). Running this sequence through the model will result in
+        # indexing errors." That warning is correct in general but false here: this
+        # encoding is never fed to a model. It exists only to read `offset_mapping`,
+        # and every tensor that reaches the model is produced by `encode_windows`
+        # below with truncation="only_second", max_length=self.max_seq_length.
+        # Left unsuppressed it appears once per tokenizer in every training log and
+        # implies a defect that does not exist. Verified: verbose=False changes the
+        # returned input_ids and offset_mapping not at all.
         encoded = self.tokenizer(
-            context, add_special_tokens=False, return_offsets_mapping=True
+            context,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            verbose=False,
         )
         offsets = encoded["offset_mapping"]
         token_count = len(offsets)
