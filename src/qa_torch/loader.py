@@ -16,6 +16,7 @@ things that are easy to get wrong and expensive to discover late:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -122,13 +123,41 @@ def load_qa_model(
 ) -> PreTrainedModel:
     """Load a model with a question answering span-prediction head.
 
+    Master weights are always fp32
+    ------------------------------
+    ``from_pretrained`` preserves whatever dtype the published checkpoint stores, and
+    not every Hub repository publishes fp32. ``microsoft/deberta-v3-base`` publishes
+    **fp16** tensors, while ``bert-base-uncased``, ``distilbert-base-uncased`` and
+    ``roberta-base`` publish fp32.
+
+    Loading fp16 and then training is silently destructive, because mixed precision
+    via ``TrainingArguments(bf16=True)`` is autocast: it expects fp32 *master* weights
+    and casts down per operation. Given fp16 masters, the optimizer updates fp16
+    directly, and AdamW does not survive that. Measured with this project's
+    hyperparameters (``lr=3e-5``, ``eps=1e-8``, ``betas=(0.9, 0.999)``):
+
+    - ``exp_avg_sq`` holds ``(1 - beta2) * grad**2``, about ``1e-9`` for a realistic
+      ``1e-3`` gradient. fp16's smallest subnormal is ``2**-24`` (``5.96e-8``), so it
+      underflows to exactly zero.
+    - ``eps=1e-8`` is *also* below that floor and rounds to zero in fp16.
+    - ``denom = sqrt(0) + 0 = 0``, so the update divides by zero. On a 4096-element
+      tensor this produced 4094 ``Inf`` and 2 ``NaN`` on optimizer **step 1**, and
+      global gradient clipping then propagated the ``NaN`` to every parameter.
+
+    So the dtype is pinned here rather than left to the checkpoint. This is the single
+    choke point every caller goes through, which keeps the invariant in one place.
+    The fp16 to fp32 upcast is exact, so no published value is altered. Pass
+    ``dtype=`` explicitly to override, for example to load fp16 for inference where no
+    optimizer is involved.
+
     Args:
         model_name: Hugging Face model id or a local checkpoint directory.
         expect_trained_head: Set ``True`` when loading a fine-tuned checkpoint. A
             warning is emitted if the ``qa_outputs`` head turns out to be randomly
             initialised, which would mean the checkpoint is not actually fine-tuned
             and every prediction would be noise.
-        **kwargs: Forwarded to ``from_pretrained``.
+        **kwargs: Forwarded to ``from_pretrained``. ``dtype`` defaults to
+            ``torch.float32``; see above for why that is not left to the checkpoint.
 
     Returns:
         The loaded model in ``eval`` mode with gradients enabled, ready for either
@@ -146,6 +175,10 @@ def load_qa_model(
             "contains a config.json.\n"
             f"Underlying error: {type(exc).__name__}: {exc}"
         ) from exc
+
+    # Never inherit the checkpoint's dtype for a model that may be trained; see the
+    # "Master weights are always fp32" note above.
+    kwargs.setdefault("dtype", torch.float32)
 
     try:
         model = AutoModelForQuestionAnswering.from_pretrained(
@@ -310,7 +343,10 @@ def verify_checkpoint_integrity(
     Returns:
         A JSON-serializable report with the parameter count, the number of drifted
         tensors, the largest absolute difference, how many LayerNorm parameters sit
-        at their default values, and an ``ok`` flag.
+        at their default values, how many parameter tensors are non-finite in memory
+        and on disk, and an ``ok`` flag. ``ok`` requires finite parameters as well as
+        an exact round trip, because ``Inf == Inf`` compares equal and would otherwise
+        pass unnoticed.
 
     Raises:
         CheckpointIntegrityError: If ``strict`` and any parameter differs, or if the
@@ -319,9 +355,23 @@ def verify_checkpoint_integrity(
     checkpoint_path = Path(checkpoint_path)
     reference = {name: tensor.detach().cpu() for name, tensor in model.named_parameters()}
 
+    # Checked before any comparison, because a model that already holds NaN cannot
+    # round-trip by definition: torch.equal treats NaN as unequal to itself, so every
+    # affected tensor reports as "drifted" and the real cause (the training run
+    # diverged) is nowhere in the message. Inf matters for the opposite reason --
+    # Inf == Inf compares equal, so an Inf-poisoned checkpoint would otherwise pass
+    # this guard silently.
+    non_finite_reference = [
+        name for name, tensor in reference.items() if not torch.isfinite(tensor).all()
+    ]
+
     # Load on CPU so this never competes with training for device memory.
     reloaded = AutoModelForQuestionAnswering.from_pretrained(str(checkpoint_path))
     actual = {name: tensor.detach().cpu() for name, tensor in reloaded.named_parameters()}
+
+    non_finite_reloaded = [
+        name for name, tensor in actual.items() if not torch.isfinite(tensor).all()
+    ]
 
     missing = sorted(set(reference) - set(actual))
     extra = sorted(set(actual) - set(reference))
@@ -336,7 +386,13 @@ def verify_checkpoint_integrity(
         if not torch.equal(found, expected):
             drifted.append(name)
             delta = (found.float() - expected.float()).abs().max().item()
-            max_delta = max(max_delta, delta)
+            # NaN must not be swallowed here. Python's max(0.0, nan) returns 0.0,
+            # because nan > 0.0 is False, which reported a checkpoint of 183,833,090
+            # NaN values as "max abs delta 0.000e+00" and sent a real investigation
+            # after the checkpoint writer instead of the training run. Once NaN is
+            # seen it dominates, since it is the more urgent signal.
+            if math.isnan(delta) or delta > max_delta:
+                max_delta = delta
 
     # A LayerNorm weight of exactly all-ones (or bias of all-zeros) is the signature
     # of a parameter that was reinitialised rather than loaded.
@@ -358,7 +414,15 @@ def verify_checkpoint_integrity(
         "missing_after_reload": missing,
         "unexpected_after_reload": extra,
         "layernorm_at_default_values": len(default_layernorm),
-        "ok": not drifted and not missing and not extra,
+        "num_non_finite_reference": len(non_finite_reference),
+        "num_non_finite_reloaded": len(non_finite_reloaded),
+        "ok": (
+            not drifted
+            and not missing
+            and not extra
+            and not non_finite_reference
+            and not non_finite_reloaded
+        ),
     }
 
     del reloaded
@@ -374,13 +438,33 @@ def verify_checkpoint_integrity(
     detail = (
         f"{len(drifted)} parameter(s) differ, {len(missing)} missing, {len(extra)} unexpected"
     )
+    if non_finite_reference:
+        # Lead with the actual diagnosis. The drift count is a consequence here, not
+        # the cause, and pointing at the checkpoint writer would waste the reader's
+        # time exactly when they are already debugging a failed run.
+        cause = (
+            f"The trained model in memory already holds {len(non_finite_reference)} "
+            f"non-finite parameter tensor(s) (NaN or Inf), so TRAINING diverged and the "
+            f"checkpoint faithfully recorded a broken model. Investigate the training "
+            f"run, not the save path: check optimizer state underflow (fp16 master "
+            f"weights cannot support AdamW at eps=1e-8), exploding gradients, and "
+            f"whether the loss went non-finite. Note that logging_nan_inf_filter is on "
+            f"by default and substitutes an average for non-finite losses, so the loss "
+            f"log may look finite while grad_norm is already NaN.\n"
+            f"First non-finite: {non_finite_reference[:8]}"
+        )
+    else:
+        cause = (
+            "Likely causes: a save/load path that bypasses from_pretrained's "
+            "key-conversion mapping, or a partially written file."
+        )
     message = (
         f"Checkpoint at {checkpoint_path} does NOT reload to the model that was saved: "
-        f"{detail} (max abs delta {max_delta:.3e}).\n"
+        f"{detail} (max abs delta {max_delta:.3e}, non-finite tensors: "
+        f"{len(non_finite_reference)} in memory / {len(non_finite_reloaded)} on disk).\n"
         f"First drifted: {drifted[:8]}\n"
         "This means the saved weights are not the trained weights. Do not report "
-        "metrics from this checkpoint. Likely causes: a save/load path that bypasses "
-        "from_pretrained's key-conversion mapping, or a partially written file."
+        f"metrics from this checkpoint. {cause}"
     )
     if strict:
         raise CheckpointIntegrityError(message)

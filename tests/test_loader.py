@@ -18,6 +18,8 @@ reloads, through this project's loader, to bit-identical parameters.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from transformers import BertConfig, BertForQuestionAnswering
@@ -348,3 +350,353 @@ class TestRealBertCheckpoint:
         assert report["ok"] is True
         assert report["num_drifted"] == 0
         assert report["layernorm_at_default_values"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the Experiment D calibration failure.
+#
+# microsoft/deberta-v3-base publishes fp16 tensors. from_pretrained preserves the
+# checkpoint dtype, so those fp16 tensors became the master parameters, and AdamW at
+# eps=1e-8 produced Inf/NaN on optimizer step 1: (1 - beta2) * grad**2 is about 1e-9
+# for a realistic 1e-3 gradient, which is below fp16's smallest subnormal (2**-24 =
+# 5.96e-8), and eps=1e-8 rounds to zero in fp16 as well, so denom becomes exactly
+# zero. Global gradient clipping then spread the NaN to all 200 parameter tensors.
+#
+# The checkpoint guard caught it but described it badly: torch.equal(NaN, NaN) is
+# False so every tensor reported as drifted, while max(0.0, nan) returns 0.0 so the
+# delta was reported as 0.000e+00.
+# ---------------------------------------------------------------------------
+
+# Small DeBERTa-v2 config mirroring deberta-v3-base's distinguishing settings:
+# relative attention only (no absolute position embeddings), no token type
+# embeddings, and the same tiny layer_norm_eps.
+TINY_DEBERTA = {
+    "vocab_size": 256,
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "intermediate_size": 64,
+    "max_position_embeddings": 64,
+    "relative_attention": True,
+    "position_buckets": 16,
+    "pos_att_type": "p2c|c2p",
+    "norm_rel_ebd": "layer_norm",
+    "share_att_key": True,
+    "position_biased_input": False,
+    "type_vocab_size": 0,
+    "layer_norm_eps": 1e-7,
+}
+
+# The project's real optimizer settings, so the underflow test exercises the
+# configuration that actually failed rather than a synthetic one.
+ADAMW_KWARGS = {"lr": 3e-5, "weight_decay": 0.01, "eps": 1e-8, "betas": (0.9, 0.999)}
+
+
+@pytest.fixture
+def tiny_deberta_qa():
+    """A small DebertaV2ForQuestionAnswering with perturbed parameters."""
+    from transformers import DebertaV2Config, DebertaV2ForQuestionAnswering
+
+    torch.manual_seed(0)
+    model = DebertaV2ForQuestionAnswering(DebertaV2Config(**TINY_DEBERTA))
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.05)
+    return model
+
+
+def _save_as_fp16(model, path) -> None:
+    """Write a checkpoint whose tensors are fp16, as deberta-v3-base publishes.
+
+    Note that ``Module.half()`` converts in place, so ``model`` is fp16 afterwards.
+    Tests that compare against it should account for that.
+    """
+    model.half().save_pretrained(path)
+
+
+class TestFp16CheckpointsLoadAsFp32:
+    """Test A: an fp16 checkpoint must arrive as fp32 master weights."""
+
+    def test_fp16_checkpoint_loads_as_fp32(self, tiny_deberta_qa, tmp_path):
+        _save_as_fp16(tiny_deberta_qa, tmp_path)
+
+        from safetensors.torch import load_file
+
+        on_disk = load_file(str(tmp_path / "model.safetensors"))
+        assert {t.dtype for t in on_disk.values()} == {torch.float16}, (
+            "the fixture failed to write an fp16 checkpoint, so this test would not "
+            "exercise the regression"
+        )
+
+        loaded = load_qa_model(str(tmp_path), expect_trained_head=True)
+
+        dtypes = {p.dtype for p in loaded.parameters()}
+        assert dtypes == {torch.float32}, f"expected all fp32 master weights, got {dtypes}"
+
+    def test_the_upcast_does_not_alter_any_value(self, tiny_deberta_qa, tmp_path):
+        """fp16 -> fp32 is exact, so pinning the dtype cannot change a published value."""
+        _save_as_fp16(tiny_deberta_qa, tmp_path)
+        expected = {n: t.detach().clone() for n, t in tiny_deberta_qa.named_parameters()}
+
+        loaded = load_qa_model(str(tmp_path), expect_trained_head=True)
+
+        for name, tensor in loaded.named_parameters():
+            assert tensor.dtype is torch.float32
+            assert torch.equal(tensor.detach(), expected[name].float()), (
+                f"{name} changed value across the fp16 -> fp32 upcast"
+            )
+
+    def test_an_explicit_dtype_is_still_honoured(self, tiny_deberta_qa, tmp_path):
+        """The default must be overridable, e.g. fp16 inference with no optimizer."""
+        _save_as_fp16(tiny_deberta_qa, tmp_path)
+        loaded = load_qa_model(str(tmp_path), dtype=torch.float16)
+        assert {p.dtype for p in loaded.parameters()} == {torch.float16}
+
+
+class TestAdamWUnderflow:
+    """Test B: the exact optimizer scenario must stay finite with fp32 parameters."""
+
+    @staticmethod
+    def _run_adamw(parameter: torch.Tensor, steps: int = 20) -> tuple[int | None, int]:
+        """Step AdamW with realistic gradients; report first non-finite step."""
+        tracked = torch.nn.Parameter(parameter.detach().clone())
+        optimizer = torch.optim.AdamW([tracked], **ADAMW_KWARGS)
+        generator = torch.Generator().manual_seed(0)
+        first_non_finite = None
+        for step in range(1, steps + 1):
+            optimizer.zero_grad(set_to_none=True)
+            gradient = torch.randn(tracked.shape, generator=generator) * 1e-3
+            tracked.grad = gradient.to(tracked.dtype)
+            optimizer.step()
+            if first_non_finite is None and not torch.isfinite(tracked).all():
+                first_non_finite = step
+        underflowed = int((optimizer.state[tracked]["exp_avg_sq"] == 0).sum())
+        return first_non_finite, underflowed
+
+    def test_fp32_parameters_stay_finite(self, tiny_deberta_qa, tmp_path):
+        _save_as_fp16(tiny_deberta_qa, tmp_path)
+        loaded = load_qa_model(str(tmp_path), expect_trained_head=True)
+
+        for name, parameter in loaded.named_parameters():
+            first_non_finite, underflowed = self._run_adamw(parameter)
+            assert first_non_finite is None, (
+                f"{name} went non-finite at AdamW step {first_non_finite} despite "
+                "being loaded as fp32"
+            )
+            assert underflowed == 0, (
+                f"{name}: {underflowed} exp_avg_sq entries underflowed to zero, which "
+                "is the precursor to a divide-by-zero in the AdamW update"
+            )
+
+    def test_fp16_parameters_would_have_failed(self):
+        """Pins the mechanism, so this test fails if the hazard ever stops being real.
+
+        Without this, the test above could keep passing for the wrong reason if some
+        future torch release changed AdamW's state dtype handling.
+        """
+        first_non_finite, underflowed = self._run_adamw(
+            torch.randn(4096, dtype=torch.float16) * 0.1
+        )
+        assert first_non_finite == 1, (
+            "fp16 master weights were expected to go non-finite on AdamW step 1; if "
+            "this changed, the rationale in load_qa_model should be revisited"
+        )
+        assert underflowed == 4096
+
+    def test_fp16_eps_and_grad_square_underflow(self):
+        """The two numeric facts the failure rests on, asserted directly."""
+        assert float(torch.tensor(1e-8, dtype=torch.float16)) == 0.0
+        assert float(torch.tensor(1e-4, dtype=torch.float16) ** 2) == 0.0
+        # An lr-sized step is below fp16 resolution for a typical weight magnitude.
+        weight = torch.tensor(0.1, dtype=torch.float16)
+        infinity = torch.tensor(float("inf"), dtype=torch.float16)
+        ulp = float(torch.nextafter(weight, infinity)) - float(weight)
+        assert ulp > 3e-5
+
+
+class TestNonFiniteCheckpointDiagnostics:
+    """Test C: a NaN checkpoint is rejected and the diagnosis is accurate."""
+
+    def test_nan_poisoned_checkpoint_is_rejected(self, tiny_deberta_qa, tmp_path):
+        with torch.no_grad():
+            for parameter in tiny_deberta_qa.parameters():
+                parameter.fill_(float("nan"))
+        tiny_deberta_qa.save_pretrained(tmp_path)
+
+        with pytest.raises(CheckpointIntegrityError) as excinfo:
+            verify_checkpoint_integrity(tiny_deberta_qa, tmp_path)
+        message = str(excinfo.value)
+        assert "does NOT reload" in message
+        assert "non-finite parameter tensor" in message
+        assert "TRAINING diverged" in message
+
+    def test_report_counts_non_finite_tensors(self, tiny_deberta_qa, tmp_path):
+        total = len(list(tiny_deberta_qa.parameters()))
+        with torch.no_grad():
+            for parameter in tiny_deberta_qa.parameters():
+                parameter.fill_(float("nan"))
+        tiny_deberta_qa.save_pretrained(tmp_path)
+
+        report = verify_checkpoint_integrity(tiny_deberta_qa, tmp_path, strict=False)
+
+        assert report["ok"] is False
+        assert report["num_non_finite_reference"] == total
+        assert report["num_non_finite_reloaded"] == total
+        assert report["num_drifted"] == total
+        assert report["missing_after_reload"] == []
+        assert report["unexpected_after_reload"] == []
+
+    def test_nan_delta_is_never_reported_as_zero(self, tiny_deberta_qa, tmp_path):
+        """The specific defect: max(0.0, nan) returned 0.0 and hid a destroyed model."""
+        with torch.no_grad():
+            for parameter in tiny_deberta_qa.parameters():
+                parameter.fill_(float("nan"))
+        tiny_deberta_qa.save_pretrained(tmp_path)
+
+        report = verify_checkpoint_integrity(tiny_deberta_qa, tmp_path, strict=False)
+
+        assert report["max_abs_delta"] != 0.0
+        assert math.isnan(report["max_abs_delta"]), (
+            "a NaN delta must surface as NaN, not be silently discarded by max()"
+        )
+
+    def test_inf_poisoned_checkpoint_is_also_rejected(self, tiny_deberta_qa, tmp_path):
+        """Inf == Inf compares equal, so equality alone would let this pass.
+
+        The failed run produced mostly Inf (4094 of 4096 elements in the reproduction),
+        so this is the common case rather than an exotic one.
+        """
+        with torch.no_grad():
+            for parameter in tiny_deberta_qa.parameters():
+                parameter.fill_(float("inf"))
+        tiny_deberta_qa.save_pretrained(tmp_path)
+
+        report = verify_checkpoint_integrity(tiny_deberta_qa, tmp_path, strict=False)
+        assert report["ok"] is False, "an Inf-poisoned checkpoint must not pass"
+        assert report["num_non_finite_reference"] == len(list(tiny_deberta_qa.parameters()))
+        assert report["num_drifted"] == 0, (
+            "Inf compares equal to itself, so this is caught by the finiteness check "
+            "rather than by drift; if drift is now non-zero the guard changed shape"
+        )
+        with pytest.raises(CheckpointIntegrityError):
+            verify_checkpoint_integrity(tiny_deberta_qa, tmp_path)
+
+    def test_a_single_nan_element_is_enough(self, tiny_deberta_qa, tmp_path):
+        """Partial corruption must not be diluted by 200 healthy tensors."""
+        with torch.no_grad():
+            tiny_deberta_qa.qa_outputs.weight[0, 0] = float("nan")
+        tiny_deberta_qa.save_pretrained(tmp_path)
+
+        report = verify_checkpoint_integrity(tiny_deberta_qa, tmp_path, strict=False)
+        assert report["ok"] is False
+        assert report["num_non_finite_reference"] == 1
+
+
+class TestCleanDebertaIntegrity:
+    """Test D: the guard must still pass a healthy DeBERTa round trip."""
+
+    def test_clean_fp32_deberta_passes(self, tiny_deberta_qa, tmp_path):
+        tiny_deberta_qa.save_pretrained(tmp_path)
+        report = verify_checkpoint_integrity(tiny_deberta_qa, tmp_path)
+
+        assert report["ok"] is True
+        assert report["num_drifted"] == 0
+        assert report["max_abs_delta"] == 0.0
+        assert report["num_non_finite_reference"] == 0
+        assert report["num_non_finite_reloaded"] == 0
+        assert report["layernorm_at_default_values"] == 0
+
+    def test_clean_fp16_deberta_round_trip_still_passes(self, tiny_deberta_qa, tmp_path):
+        """Loading fp16 explicitly is legitimate; the guard must not object to it.
+
+        This is the case that made the real failure look like a dtype bug: a clean
+        fp16 DeBERTa round-trips perfectly, so the guard was never the problem.
+        """
+        _save_as_fp16(tiny_deberta_qa, tmp_path)
+        fp16_model = load_qa_model(str(tmp_path), dtype=torch.float16)
+
+        report = verify_checkpoint_integrity(fp16_model, tmp_path)
+        assert report["ok"] is True
+        assert report["num_drifted"] == 0
+        assert report["num_non_finite_reference"] == 0
+
+    def test_real_drift_is_still_detected_on_deberta(self, tiny_deberta_qa, tmp_path):
+        tiny_deberta_qa.save_pretrained(tmp_path)
+        with torch.no_grad():
+            tiny_deberta_qa.qa_outputs.weight.add_(1.0)
+
+        report = verify_checkpoint_integrity(tiny_deberta_qa, tmp_path, strict=False)
+        assert report["ok"] is False
+        assert report["num_drifted"] == 1
+        assert report["max_abs_delta"] == pytest.approx(1.0, abs=1e-6)
+        assert report["num_non_finite_reference"] == 0
+
+
+class TestOtherArchitecturesUnchanged:
+    """Test E: BERT / RoBERTa / DistilBERT behaviour must not shift."""
+
+    @pytest.mark.parametrize(
+        ("config_cls", "model_cls", "overrides"),
+        [
+            ("BertConfig", "BertForQuestionAnswering", {}),
+            ("RobertaConfig", "RobertaForQuestionAnswering", {}),
+            (
+                "DistilBertConfig",
+                "DistilBertForQuestionAnswering",
+                {"dim": 32, "hidden_dim": 64, "n_layers": 3, "n_heads": 2},
+            ),
+        ],
+    )
+    def test_fp32_checkpoints_still_load_as_fp32(
+        self, config_cls, model_cls, overrides, tmp_path
+    ):
+        """These publish fp32, so pinning the dtype must be a no-op for them."""
+        import transformers
+
+        config_kwargs = dict(TINY_BERT)
+        if overrides:
+            for key in ("hidden_size", "intermediate_size", "num_hidden_layers",
+                        "num_attention_heads"):
+                config_kwargs.pop(key, None)
+            config_kwargs.update(overrides)
+
+        torch.manual_seed(0)
+        config = getattr(transformers, config_cls)(**config_kwargs)
+        model = getattr(transformers, model_cls)(config)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.add_(torch.randn_like(parameter) * 0.05)
+
+        expected = {n: t.detach().clone() for n, t in model.named_parameters()}
+        model.save_pretrained(tmp_path)
+
+        loaded = load_qa_model(str(tmp_path), expect_trained_head=True)
+
+        assert {p.dtype for p in loaded.parameters()} == {torch.float32}
+        for name, tensor in loaded.named_parameters():
+            assert torch.equal(tensor.detach(), expected[name]), (
+                f"{model_cls}: {name} changed across save/reload"
+            )
+
+        report = verify_checkpoint_integrity(loaded, tmp_path)
+        assert report["ok"] is True
+        assert report["num_non_finite_reference"] == 0
+
+    def test_bert_integrity_report_keeps_its_existing_keys(self, tiny_bert_qa, tmp_path):
+        """The new fields are additive; nothing downstream should lose a key."""
+        tiny_bert_qa.save_pretrained(tmp_path)
+        report = verify_checkpoint_integrity(tiny_bert_qa, tmp_path)
+
+        for key in (
+            "checkpoint_path",
+            "num_parameters_checked",
+            "num_drifted",
+            "max_abs_delta",
+            "missing_after_reload",
+            "unexpected_after_reload",
+            "layernorm_at_default_values",
+            "ok",
+        ):
+            assert key in report, f"pre-existing report key {key!r} disappeared"
+        assert report["num_non_finite_reference"] == 0
+        assert report["num_non_finite_reloaded"] == 0
