@@ -1,7 +1,32 @@
 # Lightning AI workflow
 
+> **Status: training is complete and this workflow is no longer part of the normal
+> development loop.**
+>
+> All four experiments were run on the L4, `microsoft/deberta-v3-base` was selected,
+> and its checkpoint has been copied to `models/deberta-v3-base-squad/` and verified
+> by SHA-256 against the Studio source. Inference, the frontend and all further
+> development now run locally on Windows with no GPU and no cloud dependency — see
+> **Local deployment** in the [README](../README.md).
+>
+> This document is retained because it is the record of how the checkpoint was
+> produced and how to transfer one. Return to it only to retrain or to run a new
+> experiment.
+
 Training runs on a **Lightning AI Studio with an NVIDIA L4**. The local Windows
-machine is for development only.
+machine handles authoring, testing, and — now that training is finished — inference
+and the web interface.
+
+## Division of environments
+
+| | Lightning AI Studio (Linux, NVIDIA L4) | Local (Windows, CPU-only) |
+|---|---|---|
+| Role | GPU training and evaluation | Inference, frontend, Git workflow |
+| Status | **Complete; not required for inference** | **Active** |
+| Runs | `qa_ml train`, full-split evaluation | FastAPI `:8000`, Next.js `:3000`, `pytest` |
+| Holds | `artifacts/runs/<run_id>/` | `models/deberta-v3-base-squad/` |
+
+Nothing about local inference depends on Lightning being reachable.
 
 Verified locally: `nvidia-smi` is not on PATH and `torch.cuda.is_available()`
 returns `False`, so the local machine has no usable GPU. Attempting to train here
@@ -93,10 +118,10 @@ lightning login       # interactive browser OAuth; no token enters the repo
 lightning machine     # confirm an L4 instance type is available to you
 ```
 
-### 3. Create a GitHub remote
+### 3. GitHub remote
 
-No remote exists yet, and the `gh` CLI is not installed locally. Create an empty
-repository through the GitHub web UI (or install `gh`), then:
+Already configured — `origin` points at the project repository and `main` tracks it.
+This step is only relevant when setting up a fresh clone:
 
 ```powershell
 git remote add origin <your-repo-url>
@@ -167,6 +192,18 @@ defence against losing hours of GPU time to a dropped connection.
 | Every checkpoint | Lightning model registry | `lightning model` | No |
 | Selected checkpoint | local `models/` | `lightning cp` | No |
 | Final chosen model | Hugging Face Hub | `hf upload` (optional) | No |
+
+**Completed transfer, for the record.** `artifacts/runs/<run_id>/model/` →
+`models/deberta-v3-base-squad/`, 735,356,752 bytes of `model.safetensors` verified
+bit-for-bit:
+
+```
+SHA-256  f42b44e4904f132c18512c70c5c438a6b2daaf551d127b3f6213ff208a39de1f
+```
+
+Verify any future transfer the same way — `sha256sum` on the Studio, `Get-FileHash`
+on Windows. A partial copy of a 700 MB file otherwise fails much later, as an
+obscure load error rather than as a transfer problem.
 
 **Rule: nothing valuable ends a session living only in Studio-local storage.**
 Register checkpoints with `lightning model` before detaching the GPU. A lost run
