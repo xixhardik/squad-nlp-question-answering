@@ -45,12 +45,20 @@ class Settings(BaseSettings):
 
     app_name: str = "qas-nlp-backend"
     app_version: str = "0.1.0"
-    phase: str = "1"
+    phase: str = "13"
     log_level: str = "INFO"
 
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
     model_path: str | None = None
+
+    max_seq_length: int = 384
+    doc_stride: int = 128
+    max_question_length: int = 64
+    n_best_size: int = 20
+    max_answer_length: int = 30
+    max_n_best: int = 10
+    batch_size: int = 8
 
     max_context_chars: int = 20_000
     max_question_chars: int = 512
