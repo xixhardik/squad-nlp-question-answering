@@ -1,18 +1,18 @@
+import QuestionAnswerer from "@/components/question-answerer";
 import { apiBaseUrl, isApiConfigured } from "@/lib/config";
 
 /**
- * Phase 1 landing page.
+ * Question answering page.
  *
- * Scope is deliberately narrow: identify the project, explain what extractive
- * question answering is, and report build status honestly.
+ * A Server Component for the static explanatory content, with the interactive
+ * form isolated in the `QuestionAnswerer` Client Component. That keeps the
+ * JavaScript payload limited to the part that genuinely needs it.
  *
- * Deliberately absent:
- *  - no context or question inputs (Phase 14)
- *  - no answer card, no score, no latency, no highlighted span
- *  - no network calls
- *
- * No model has been trained, so any answer shown here would be fabricated.
- * Rendering an empty answer card would misrepresent how far along the project is.
+ * No accuracy figures are printed here. The evaluation records live with the
+ * training runs on the GPU environment and are not committed to this
+ * repository, so quoting a number in the UI would be an unverifiable claim.
+ * The model actually serving a request identifies itself through `model_id` in
+ * the prediction response instead.
  */
 
 const PIPELINE_STAGES = [
@@ -28,16 +28,15 @@ const PIPELINE_STAGES = [
 ] as const;
 
 const PHASES = [
-  { id: 0, name: "Architecture and repository audit", state: "done" },
   { id: 1, name: "Project foundation and reproducible environment", state: "done" },
-  { id: 2, name: "Lightning L4 GPU environment validation", state: "next" },
-  { id: 3, name: "SQuAD dataset exploration", state: "todo" },
-  { id: 4, name: "Tokenization and answer-span preprocessing", state: "todo" },
-  { id: 6, name: "DistilBERT smoke training", state: "todo" },
-  { id: 7, name: "Model training experiments (4 candidates)", state: "todo" },
-  { id: 11, name: "Model comparison and selection", state: "todo" },
-  { id: 13, name: "FastAPI inference backend", state: "todo" },
-  { id: 14, name: "Question answering interface", state: "todo" },
+  { id: 2, name: "SQuAD 1.1 pipeline, span alignment and evaluation", state: "done" },
+  { id: 3, name: "Tokenizer and checkpoint integrity audit", state: "done" },
+  { id: 4, name: "Dataset preparation evidence (full-split report)", state: "done" },
+  { id: 5, name: "DistilBERT, BERT-base and RoBERTa-base experiments", state: "done" },
+  { id: 6, name: "DeBERTa-v3-base experiment", state: "done" },
+  { id: 7, name: "Model comparison and selection", state: "done" },
+  { id: 13, name: "FastAPI inference backend", state: "done" },
+  { id: 14, name: "Question answering interface", state: "done" },
 ] as const;
 
 function StateBadge({ state }: { state: "done" | "next" | "todo" }) {
@@ -74,21 +73,9 @@ export default function Home() {
         </p>
       </header>
 
-      <section
-        aria-labelledby="status-heading"
-        className="mt-10 rounded-xl border border-amber-500/30 bg-amber-500/5 p-5"
-      >
-        <h2 id="status-heading" className="text-sm font-semibold text-amber-300">
-          Under construction — Phase 1 of 17 complete
-        </h2>
-        <p className="mt-2 text-sm leading-relaxed text-slate-300">
-          This is the project foundation only. No model has been trained yet, so
-          the question answering interface is not present and no accuracy figures
-          are shown. Nothing on this page is a model output.
-        </p>
-      </section>
+      <QuestionAnswerer />
 
-      <section aria-labelledby="pipeline-heading" className="mt-12">
+      <section aria-labelledby="pipeline-heading" className="mt-14">
         <h2
           id="pipeline-heading"
           className="text-lg font-semibold tracking-tight text-white"
@@ -123,6 +110,10 @@ export default function Home() {
         >
           Build progress
         </h2>
+        <p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-400">
+          Training and evaluation ran on an NVIDIA L4; this interface and the
+          inference API are the serving layer over the selected checkpoint.
+        </p>
         <ul className="mt-5 space-y-2">
           {PHASES.map((phase) => (
             <li
@@ -168,8 +159,9 @@ export default function Home() {
         </dl>
         <p className="mt-3 text-xs leading-relaxed text-slate-500">
           The backend URL comes from the environment with no localhost fallback in
-          source. This page does not call the API; connectivity is wired up in
-          Phase 15.
+          source. Predictions are requested from{" "}
+          <code className="font-mono">POST /predict</code> on that host; if it is
+          unset the form above stays disabled.
         </p>
       </section>
 
