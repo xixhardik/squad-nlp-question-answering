@@ -6,10 +6,15 @@ so preprocessing can be tested without downloading 87,599 examples.
 
 Contexts are chosen deliberately: one short enough to fit a single window, one long
 enough to force sliding-window overflow at a small ``max_seq_length``.
+
+:func:`isolate_device_environment` at the end of this module keeps device resolution
+independent of the developer's shell. The backend has its own, broader isolation in
+``backend/tests/conftest.py``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -130,3 +135,30 @@ def repeated_answer_example() -> dict[str, Any]:
         "question": "Where is the rainforest mostly located?",
         "answers": {"text": ["Brazil"], "answer_start": [second]},
     }
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_device_environment() -> Iterator[None]:
+    """Hide ``QAS_DEVICE`` from the suite, then restore it.
+
+    Same class of defect as the backend's ``QAS_MODEL_PATH`` problem, found while fixing
+    it. :func:`qa_torch.device.resolve_device` consults ``QAS_DEVICE`` when called with no
+    argument, and ``test_device.py::test_automatic_resolution_matches_availability``
+    asserts the *automatic* choice matches measured hardware. A developer with
+    ``QAS_DEVICE=cpu`` exported on a CUDA machine would fail that test for a reason that
+    has nothing to do with the code.
+
+    Deliberately narrow. ``QAS_ARTIFACTS_DIR`` and ``QAS_DATA_DIR`` are left alone: they
+    redirect writable directories on the Lightning Studio, that redirection is a supported
+    configuration, and ``test_project_structure.py`` is written to tolerate it. Clearing
+    them would stop the suite from exercising the machine it is actually running on.
+
+    The three tests that set ``QAS_DEVICE`` on purpose keep working: their function-scoped
+    ``monkeypatch.setenv`` is applied after this fixture and undone before it.
+
+    Yields:
+        ``None``. The isolation is a side effect for the duration of the session.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("QAS_DEVICE", raising=False)
+        yield

@@ -12,9 +12,19 @@ from app.main import app, create_app
 
 
 @pytest.fixture(scope="module")
-def client() -> TestClient:
-    """Return a test client bound to the module-level application."""
-    with TestClient(app) as test_client:
+def client(no_model_settings: Settings) -> TestClient:
+    """Return a test client over an application explicitly configured with no model.
+
+    Built from :func:`no_model_settings` rather than the module-level ``app.main.app``.
+    That global is constructed at import time from the ambient environment, so on a
+    developer machine with ``QAS_MODEL_PATH`` set it loads the real DeBERTa checkpoint --
+    which both inverted the "no model configured" assertions below and made every test in
+    this module wait on a checkpoint load it has no interest in.
+
+    Nothing is weakened by this: the unconfigured branch is now genuinely exercised on
+    every machine instead of only on machines that happen to have no model configured.
+    """
+    with TestClient(create_app(no_model_settings)) as test_client:
         yield test_client
 
 
@@ -38,6 +48,7 @@ class TestHealthEndpoint:
         assert field in client.get("/health").json()
 
     def test_reports_no_model_loaded_without_model_path(self, client):
+        """The unconfigured branch, on an app that was explicitly told it has no model."""
         assert client.get("/health").json()["model_loaded"] is False
 
     def test_service_and_version_are_populated(self, client):
@@ -77,6 +88,7 @@ class TestPredictEndpoint:
         assert response.status_code == 405
 
     def test_predict_returns_503_without_model(self, client):
+        """503 is the contract when no model is configured, not an accident of the shell."""
         response = client.post(
             "/predict",
             json={
@@ -142,6 +154,9 @@ class TestApplicationFactory:
             app_name="test-service",
             app_version="9.9.9",
             phase="test",
+            # Declared, not inherited: this app starts a lifespan, and a model path
+            # leaking in from the environment would load the real checkpoint.
+            model_path=None,
         )
 
         with TestClient(create_app(settings)) as test_client:
@@ -173,7 +188,8 @@ class TestCors:
 
     def test_allowed_origin_receives_cors_header(self):
         settings = Settings(
-            allowed_origins=["http://localhost:3000"]
+            allowed_origins=["http://localhost:3000"],
+            model_path=None,
         )
 
         with TestClient(create_app(settings)) as test_client:
@@ -189,7 +205,8 @@ class TestCors:
 
     def test_disallowed_origin_receives_no_cors_header(self):
         settings = Settings(
-            allowed_origins=["http://localhost:3000"]
+            allowed_origins=["http://localhost:3000"],
+            model_path=None,
         )
 
         with TestClient(create_app(settings)) as test_client:
@@ -225,6 +242,54 @@ class TestOpenApiSchema:
 
         assert "/predict" in schema["paths"]
         assert "post" in schema["paths"]["/predict"]
+
+
+class TestEnvironmentIsolation:
+    """The isolation itself is asserted, not assumed.
+
+    Without these, the ``conftest`` fixture could silently stop working and the two
+    "no model configured" tests would go back to passing or failing according to whose
+    shell they ran in. They also pin the precedence the fixture relies on, so a
+    pydantic-settings upgrade that reordered its sources would be caught here rather than
+    as a confusing failure elsewhere.
+    """
+
+    def test_no_qas_variable_is_visible_during_the_tests(self):
+        import os
+
+        leaked = sorted(name for name in os.environ if name.startswith("QAS_"))
+        assert leaked == [], (
+            f"{leaked} leaked into the backend tests; Settings reads the whole QAS_ prefix"
+        )
+
+    def test_settings_read_no_model_path_by_default(self):
+        assert Settings().model_path is None
+
+    def test_an_explicit_model_path_overrides_the_environment(self, monkeypatch):
+        """Simulates the developer shell, so this holds however the machine is configured."""
+        monkeypatch.setenv("QAS_MODEL_PATH", "/ambient/from/shell")
+        assert Settings(model_path=None).model_path is None
+        assert Settings(model_path="/explicit").model_path == "/explicit"
+
+    def test_production_still_reads_the_environment(self, monkeypatch):
+        """The isolation is a test-boundary concern; the service's behaviour is untouched."""
+        monkeypatch.setenv("QAS_MODEL_PATH", "/ambient/from/shell")
+        assert Settings().model_path == "/ambient/from/shell"
+
+    def test_the_client_fixture_app_is_not_the_module_level_app(self, client):
+        """The global app is built at import time from the ambient environment.
+
+        The fixture deliberately does not use it, which is what makes the unconfigured
+        branch testable on a machine that has a model configured.
+        """
+        assert client.app is not app
+
+    def test_the_module_level_app_is_still_importable_and_routed(self):
+        """Isolating the fixture must not stop the real application from being built."""
+        assert {getattr(route, "path", None) for route in app.routes} >= {
+            "/health",
+            "/predict",
+        }
 
 
 class TestPredictWithMockedEngine:
