@@ -1,0 +1,115 @@
+# =============================================================================
+# Qwen3-4B QLoRA question generation - smoke configuration
+# =============================================================================
+# The smallest run that exercises the whole path. Every value that the L4
+# feasibility measurement covered is left at its default, so this configuration
+# reports zero deviations from qa_gen.config.VERIFIED_QWEN3_4B_L4:
+#
+#   Qwen/Qwen3-4B, 4-bit NF4, double quantization, bf16 compute,
+#   sequence length 1024, LoRA r=16 alpha=32 dropout=0.05 over seven projections
+#
+# Validate it without downloading anything:
+#
+#   python -m qa_gen_runtime.train --config ml/configs/qgen/qgen-smoke.yaml --plan
+#
+# Lives in ml/configs/qgen/ rather than ml/configs/ because the parent directory
+# has an implicit contract that every *.yaml in it is a qa_ml ExperimentConfig
+# for extractive QA -- asserted by tests/test_config.py. A generative config has
+# a different schema and a different loader, so it belongs in its own namespace.
+#
+# Read by qa_gen_runtime.config_io, which hands the mapping to
+# qa_gen.config.experiment_config_from_dict. Unknown keys are rejected rather
+# than ignored, so a typo fails at load instead of training with a default.
+# =============================================================================
+
+name: qgen-smoke
+description: >-
+  Smallest end-to-end rehearsal of the QLoRA question-generation path. Caps the
+  step count so it finishes in minutes and proves the plumbing rather than
+  producing a usable adapter.
+phase: "17"
+
+dataset:
+  # No sources named: every registered adapter is eligible. A headline run should
+  # name them explicitly so the corpus mix is recorded rather than inferred.
+  sources: []
+  seed: 42
+  train_ratio: 0.8
+  validation_ratio: 0.1
+  test_ratio: 0.1
+  # Passage-level grouping, so the same context cannot appear in two splits.
+  group_by: context
+  max_examples: 256
+  min_context_chars: 64
+  max_context_chars: 4000
+
+model:
+  model_id: Qwen/Qwen3-4B
+  # "main" is fine for a smoke run. Pin a commit sha before any run whose numbers
+  # get reported, so the weights a metric was measured on are unambiguous.
+  revision: main
+  quantization: 4bit
+  quantization_type: nf4
+  double_quantization: true
+  compute_dtype: bf16
+  # 1024 is the measured baseline. 2048 was never tested; raising it is supported
+  # and will be reported as a deviation.
+  max_seq_length: 1024
+  # Disabled: the supervision target is a bare JSON object, and a reasoning
+  # preamble would make every generation fail schema validation.
+  reasoning_mode: disabled
+  chat_template: tokenizer
+  trust_remote_code: false
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  bias: none
+  task_type: CAUSAL_LM
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  learning_rate: 0.0002
+  # Batch 1 is what the feasibility test actually measured. Kept here rather than
+  # extrapolating, so the first real run rehearses a demonstrated configuration.
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  # A step cap is what makes this a smoke run.
+  max_steps: 20
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  precision: auto
+  # Runtime configuration, not a benchmarked choice.
+  optimizer: paged_adamw_8bit
+  evaluation_strategy: "no"
+  save_strategy: "no"
+  load_best_model_at_end: false
+  metric_for_best_model: loss
+  greater_is_better: false
+  logging_steps: 1
+  save_total_limit: 1
+  gradient_checkpointing: true
+  completion_only_loss: true
+  packing: false
+  seed: 42
+
+evaluation:
+  metrics:
+    - json_validity
+    - schema_validity
+    - question_type_accuracy
+    - difficulty_accuracy
+    - answer_token_f1
+  decoding: greedy
+  max_new_tokens: 512
+  max_eval_examples: 32
