@@ -966,21 +966,54 @@ class TestReasoningModeHandling:
         with pytest.raises(ValueError, match="no chat template"):
             apply_chat_template([{"role": "user", "content": "x"}], config().model, tokenizer)
 
-    def test_the_description_records_whether_the_request_took_effect(self):
+    def test_the_description_records_whether_the_request_took_effect_at_inference(self):
         inert = describe_chat_handling(
-            config().model, SimpleNamespace(chat_template="{{ messages }}")
+            config().model,
+            SimpleNamespace(chat_template="{{ messages }}"),
+            stage="inference",
         )
         assert inert["effective"].startswith("inert")
 
         applied = describe_chat_handling(
+            config().model,
+            SimpleNamespace(chat_template="{{ enable_thinking }}"),
+            stage="inference",
+        )
+        assert applied["effective"].startswith("applied")
+
+    def test_the_training_stage_does_not_claim_the_flag_was_applied(self):
+        """TRL renders the template itself, so nothing here applies the mode during training.
+
+        A record saying "applied" for a training run would be a false statement about what
+        produced the checkpoint, which is the one thing a run record must not do.
+        """
+        record = describe_chat_handling(
             config().model, SimpleNamespace(chat_template="{{ enable_thinking }}")
         )
-        assert applied["effective"] == "applied"
+        assert record["stage"] == "training"
+        assert record["applied_by"] == "trl.SFTTrainer"
+        assert record["effective"].startswith("not applied")
+
+    def test_the_training_description_explains_why_no_trained_token_changes(self):
+        record = describe_chat_handling(
+            config().model, SimpleNamespace(chat_template="{{ enable_thinking }}")
+        )
+        assert "generation prompt" in record["effective"]
 
     def test_the_description_works_before_a_tokenizer_exists(self):
-        record = describe_chat_handling(config().model, None)
+        record = describe_chat_handling(config().model, None, stage="inference")
         assert record["reasoning_mode"] == "disabled"
         assert record["effective"] is None
+
+    def test_the_records_carry_no_chat_template_kwargs_column(self):
+        """The column TRL would read is deliberately not emitted; see qa_gen_runtime.chat.
+
+        Pinned so that adding it becomes a deliberate act. Setting it would change the
+        prompt-only rendering that the completion mask is measured against, and whether TRL
+        guards the resulting prefix mismatch in the SFT tokenize path is unverified.
+        """
+        record = build_training_records([example()], config())[0]
+        assert "chat_template_kwargs" not in record
 
 
 class TestTrainerArgumentTranslation:

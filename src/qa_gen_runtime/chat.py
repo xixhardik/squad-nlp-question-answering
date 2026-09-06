@@ -25,6 +25,34 @@ template does not reference it is at best ignored and at worst a Jinja error, so
 :func:`chat_template_kwargs` inspects the template source first and returns an empty mapping
 when the flag would mean nothing. A model without a thinking mode therefore needs no special
 case, and ``reasoning_mode`` is simply inert for it -- which is reported rather than silent.
+
+Who actually applies the template, and where this module is used
+---------------------------------------------------------------
+Worth being precise about, because it is easy to assume this module is on the training path
+and it is not. TRL's ``SFTTrainer`` applies the chat template **itself** while preparing the
+dataset: for a conversational prompt-completion record it calls
+``processing_class.apply_chat_template`` on the prompt with ``add_generation_prompt=True`` and
+on prompt-plus-completion without, then derives the completion mask from the difference. It
+reads extra template arguments from an optional per-example ``chat_template_kwargs`` column,
+not from anything this module does.
+
+So during training, :func:`apply_chat_template` here is **not called**, and ``reasoning_mode``
+does not reach the tokenizer. That is deliberate rather than an oversight, and the reasoning is
+worth recording:
+
+- For Qwen3 the flag only alters the ``add_generation_prompt`` branch of the template. The
+  trained sequence is the prompt-plus-completion rendering, which has no generation prompt, so
+  the flag cannot change a single trained token.
+- Setting it *would* change the prompt-only rendering, which is what the completion mask is
+  measured against. If the flag adds an empty ``<think></think>`` block to the prompt that the
+  combined rendering does not contain, the prompt is no longer a prefix of prompt-plus-completion
+  and the mask can shift -- silently training on a truncated target. Whether TRL guards that in
+  this code path is unverified.
+
+The mode therefore matters at **inference**, where the generation prompt is the whole point, and
+that is where :func:`apply_chat_template` is used. :func:`describe_chat_handling` says which of
+the two situations a record describes, so a run's metadata never claims suppression that did not
+happen.
 """
 
 from __future__ import annotations
@@ -131,32 +159,58 @@ def apply_chat_template(
 
 
 def describe_chat_handling(
-    config: GeneratorModelConfig, tokenizer: Any | None = None
+    config: GeneratorModelConfig,
+    tokenizer: Any | None = None,
+    *,
+    stage: str = "training",
 ) -> dict[str, Any]:
     """Return a JSON-serializable record of how prompts will be assembled.
 
     Recorded in the diagnostics because "was thinking mode on?" is exactly the kind of question
     that becomes unanswerable a week after a confusing result.
 
+    ``stage`` exists because the honest answer differs between the two, and an earlier version
+    of this function reported ``"applied"`` for a training run in which nothing applied the
+    flag: TRL renders the template itself and never consults this module. A record that
+    overstates what happened is worse than one that says nothing.
+
     Args:
         config: The Phase 17A model configuration.
         tokenizer: The tokenizer, when one has been loaded. Omitted during a dry run.
+        stage: ``"training"`` or ``"inference"``. Under ``"training"`` the template is applied by
+            TRL, so the mode is reported as not reaching the tokenizer. Under ``"inference"``
+            :func:`apply_chat_template` is the caller and the mode does take effect.
 
     Returns:
-        A mapping describing the mode, whether the template understands the flag, and whether
-        the request will actually take effect.
+        A mapping describing the mode, whether the template understands the flag, who applies
+        the template at this stage, and whether the request actually reaches it.
     """
     supported = template_supports_reasoning_flag(tokenizer) if tokenizer is not None else None
     applied = chat_template_kwargs(config, tokenizer) if tokenizer is not None else {}
+    if stage == "training":
+        effective = (
+            "not applied: TRL renders the chat template during dataset preparation and reads "
+            "template arguments from a per-example 'chat_template_kwargs' column, which this "
+            "runtime does not emit. For Qwen3 the flag only alters the generation prompt, "
+            "which the trained sequence does not contain, so no trained token is affected."
+        )
+    else:
+        effective = (
+            None
+            if tokenizer is None
+            else (
+                "applied: passed to the tokenizer's chat template"
+                if applied
+                else "inert: the template does not use the flag"
+            )
+        )
     return {
         "chat_template": config.chat_template,
         "reasoning_mode": config.reasoning_mode,
         "reasoning_suppressed": config.suppresses_reasoning,
         "template_supports_reasoning_flag": supported,
         "template_kwargs": dict(applied),
-        "effective": (
-            None
-            if tokenizer is None
-            else ("applied" if applied else "inert: the template does not use the flag")
-        ),
+        "stage": stage,
+        "applied_by": "trl.SFTTrainer" if stage == "training" else "qa_gen_runtime.chat",
+        "effective": effective,
     }
