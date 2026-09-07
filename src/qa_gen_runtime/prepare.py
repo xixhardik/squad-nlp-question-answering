@@ -279,6 +279,33 @@ def audit_dataset(
             )
 
     if sizing is not None and sizing.measured and sizing.overall is not None:
+        # A supervised target of zero tokens carries no learning signal, so this is always a
+        # defect rather than a property of a corpus. It is checked because the first Phase 17C
+        # sizing run reported a completion of 0 tokens for all 1,996 records -- a tokenizer
+        # return shape misread as a length -- and nothing in the report said so.
+        if sizing.overall.completion_tokens.minimum <= 0:
+            findings.append(
+                AuditFinding(
+                    code="empty_completion_tokens",
+                    message=(
+                        "at least one record has a completion of zero tokens, so it carries no "
+                        "learning signal. A completion length of zero across many records "
+                        "means the measurement is wrong rather than the data: check that "
+                        "apply_chat_template was asked for token ids and not a BatchEncoding."
+                    ),
+                )
+            )
+        if sizing.overall.prompt_tokens.minimum <= 0:
+            findings.append(
+                AuditFinding(
+                    code="empty_prompt_tokens",
+                    message=(
+                        "at least one record has a prompt of zero tokens, which cannot contain "
+                        "a passage and an output contract. The measurement is wrong."
+                    ),
+                )
+            )
+
         rate = sizing.overall.truncation_rate
         if rate > _TRUNCATION_THRESHOLD:
             findings.append(

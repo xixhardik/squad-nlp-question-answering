@@ -251,9 +251,17 @@ class FakeTokenizer:
         *,
         add_generation_prompt: bool = False,
         tokenize: bool = True,
+        return_dict: bool = True,
         **kwargs: Any,
     ) -> Any:
-        """Render, then tokenize when asked."""
+        """Render, then tokenize when asked.
+
+        ``return_dict`` defaults to ``True``, which is what transformers 5.x does and what an
+        earlier version of this stub got wrong. Returning a bare list regardless made the stub
+        more forgiving than the library: a caller that took ``len()`` of the result got a token
+        count here and the number of ``BatchEncoding`` keys -- 2 -- on the Studio. The stub now
+        reproduces the library's shape so the tests can catch that.
+        """
         parts: list[str] = []
         for message in messages:
             role, content = message["role"], message["content"]
@@ -270,7 +278,10 @@ class FakeTokenizer:
         text = "".join(parts)
         if not tokenize:
             return text
-        return [self._identifier(atom) for atom in _ATOM.findall(text)]
+        ids = [self._identifier(atom) for atom in _ATOM.findall(text)]
+        if return_dict:
+            return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        return ids
 
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
         """Join the atoms the ids stand for."""
@@ -1176,6 +1187,225 @@ class TestTokenMeasurement:
 
     def test_combining_nothing_yields_an_empty_summary(self):
         assert summarize_token_lengths({}).examples == 0
+
+
+class TestRealSquadRecordLengths:
+    """Regression guard for the 2-token prompt / 0-token completion collapse.
+
+    A first Phase 17C sizing run over 1,996 real ``rajpurkar/squad`` records reported
+    ``prompt min=2 mean=2.0 max=2``, ``completion min=0 max=0`` and a truncation rate of zero.
+    The cause was not the adapter, the target schema or the record shape: transformers 5.x
+    defaults ``apply_chat_template(..., tokenize=True)`` to ``return_dict=True``, so it returns
+    a ``BatchEncoding``, and ``len()`` of that is the key count -- ``input_ids`` plus
+    ``attention_mask``, so 2.
+
+    Every assertion here is on a realistic magnitude rather than an internal consistency
+    property, because 2 and 0 are internally consistent: 2 - 2 == 0, and 2 < 1024.
+    """
+
+    def squad_records(self, count: int = 4):
+        """Adapt realistic SQuAD rows and render them into conversational records.
+
+        The passages are deliberately of differing lengths, as real SQuAD paragraphs are. A
+        fixture of uniform length cannot distinguish a real measurement from a constant.
+        """
+        tokenizer = FakeTokenizer()
+        config = experiment_config()
+        rows = []
+        for index in range(count):
+            row = squad_record(index)
+            # Real SQuAD paragraphs run from roughly one sentence to several hundred words.
+            row["context"] = f"{row['context']} " + ("Additional detail. " * (index * 4))
+            rows.append(row)
+        examples = list(adapt_records("squad-qg", rows))
+        records = build_training_records(examples, config, tokenizer=tokenizer)
+        return records, tokenizer, config, examples
+
+    def test_the_adapter_produces_the_expected_target_schema(self):
+        """Rule out source adaptation before blaming the measurement."""
+        _, _, _, examples = self.squad_records(1)
+        assert len(examples) == 1
+        item = examples[0]
+        assert item.source == "squad-qg"
+        assert len(item.targets) == 1
+        target_object = item.targets[0]
+        assert target_object.question_type is QuestionType.SHORT_ANSWER
+        assert target_object.difficulty is Difficulty.EASY
+        assert target_object.marks == 1
+        assert target_object.question.strip()
+        assert target_object.answer == "Chlorophyll"
+        assert item.grounding is not None, "a verified SQuAD offset must ground the example"
+
+    def test_the_records_carry_real_prompt_and_completion_content(self):
+        """Rule out record construction too."""
+        records, _, _, examples = self.squad_records(1)
+        record = records[0]
+        assert [message["role"] for message in record["prompt"]] == ["system", "user"]
+        assert [message["role"] for message in record["completion"]] == ["assistant"]
+        user = record["prompt"][1]["content"]
+        assert examples[0].context in user
+        assert len(user) > 300, "the user turn carries the passage and the output contract"
+        completion = record["completion"][0]["content"]
+        assert completion.startswith('{"question_type":')
+        assert "Chlorophyll" in completion
+        assert record["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_prompt_and_completion_lengths_are_realistic(self):
+        """The assertion the shipped bug fails: 2 and 0 are not plausible token counts."""
+        records, tokenizer, config, _ = self.squad_records()
+        sizing = measure_record_lengths(records, tokenizer, config, split="train")
+
+        assert sizing.prompt_tokens.minimum > 100, (
+            "a prompt holding a SQuAD passage and the output contract cannot be this short; "
+            f"got min={sizing.prompt_tokens.minimum}"
+        )
+        assert sizing.completion_tokens.minimum > 10, (
+            "the supervised target is a JSON object with a question and an answer; "
+            f"got min={sizing.completion_tokens.minimum}"
+        )
+        assert sizing.total_tokens.minimum > 110
+
+    def test_no_record_has_an_empty_completion(self):
+        """Zero supervised tokens means no learning signal, whatever the corpus."""
+        records, tokenizer, config, _ = self.squad_records()
+        sizing = measure_record_lengths(records, tokenizer, config, split="train")
+        assert sizing.completion_tokens.minimum > 0
+        assert sizing.prompt_tokens.minimum > 0
+
+    def test_the_lengths_are_not_the_key_count_of_a_batch_encoding(self):
+        """Named for the exact failure, so a future regression is unambiguous."""
+        records, tokenizer, config, _ = self.squad_records()
+        sizing = measure_record_lengths(records, tokenizer, config, split="train")
+        assert sizing.prompt_tokens.maximum != 2
+        assert sizing.total_tokens.maximum != 2
+        assert sizing.completion_tokens.maximum != 0
+
+    def test_the_lengths_vary_across_records(self):
+        """Every record reporting an identical length is the signature of a constant."""
+        records, tokenizer, config, _ = self.squad_records(6)
+        sizing = measure_record_lengths(records, tokenizer, config, split="train")
+        assert sizing.total_tokens.minimum != sizing.total_tokens.maximum
+
+    def test_a_dict_returning_tokenizer_is_handled(self):
+        """Transformers 5.x returns a BatchEncoding; the ids must be taken from it."""
+        records, tokenizer, config, _ = self.squad_records(2)
+
+        class DictOnlyTokenizer(FakeTokenizer):
+            """Ignores return_dict and always returns a mapping, as a strict 5.x would."""
+
+            def apply_chat_template(self, messages, **kwargs):
+                kwargs["return_dict"] = False
+                ids = super().apply_chat_template(messages, **kwargs)
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+        strict = DictOnlyTokenizer()
+        strict._atoms = tokenizer._atoms
+        sizing = measure_record_lengths(records, strict, config, split="train")
+        assert sizing.prompt_tokens.minimum > 100
+        assert sizing.completion_tokens.minimum > 10
+
+    def test_a_list_returning_tokenizer_is_handled(self):
+        """A tokenizer honouring return_dict=False must work identically."""
+        records, tokenizer, config, _ = self.squad_records(2)
+
+        class ListOnlyTokenizer(FakeTokenizer):
+            """Always returns a bare list, as transformers 4.x did."""
+
+            def apply_chat_template(self, messages, **kwargs):
+                kwargs["return_dict"] = False
+                return super().apply_chat_template(messages, **kwargs)
+
+        listing = ListOnlyTokenizer()
+        listing._atoms = tokenizer._atoms
+        assert measure_record_lengths(
+            records, listing, config, split="train"
+        ).prompt_tokens.minimum > 100
+
+    def test_a_batched_list_of_lists_is_unwrapped(self):
+        """Some processors return a batch of one even for a single example."""
+        records, tokenizer, config, _ = self.squad_records(2)
+
+        class BatchedTokenizer(FakeTokenizer):
+            """Wraps the ids in an outer list, as a VLM processor does."""
+
+            def apply_chat_template(self, messages, **kwargs):
+                kwargs["return_dict"] = False
+                ids = super().apply_chat_template(messages, **kwargs)
+                return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
+
+        batched = BatchedTokenizer()
+        batched._atoms = tokenizer._atoms
+        assert measure_record_lengths(
+            records, batched, config, split="train"
+        ).completion_tokens.minimum > 10
+
+    def test_a_mapping_without_input_ids_is_refused(self):
+        records, tokenizer, config, _ = self.squad_records(1)
+
+        class WrongKeys(FakeTokenizer):
+            """Returns a mapping that carries no token ids."""
+
+            def apply_chat_template(self, messages, **kwargs):
+                return {"attention_mask": [1, 1, 1]}
+
+        with pytest.raises(SizingError, match="no 'input_ids'"):
+            measure_record_lengths(records, WrongKeys(), config)
+
+    def test_a_non_sequence_return_is_refused(self):
+        records, tokenizer, config, _ = self.squad_records(1)
+
+        class ReturnsAnInt(FakeTokenizer):
+            """Returns something that is not a sequence at all."""
+
+            def apply_chat_template(self, messages, **kwargs):
+                return 457
+
+        with pytest.raises(SizingError, match="not a sequence of"):
+            measure_record_lengths(records, ReturnsAnInt(), config)
+
+    def collapsed_sizing(self):
+        """Build the exact degenerate measurement the Studio reported: 2 prompt, 0 completion."""
+        from qa_gen_runtime.sizing import DatasetSizing, SplitSizing
+
+        collapsed = SplitSizing(
+            split="overall",
+            examples=1996,
+            prompt_tokens=TokenLengthSummary.from_values([2] * 1996),
+            completion_tokens=TokenLengthSummary.from_values([0] * 1996),
+            total_tokens=TokenLengthSummary.from_values([2] * 1996),
+            truncated=0,
+            max_seq_length=1024,
+        )
+        return DatasetSizing(
+            tokenizer_id="Qwen/Qwen3-4B",
+            max_seq_length=1024,
+            measured=True,
+            splits={"train": collapsed},
+            overall=collapsed,
+        )
+
+    def test_the_audit_blocks_the_collapsed_measurement(self):
+        """Had this finding existed, the first run would not have looked like a success."""
+        prepared = prepare_dataset(adapted_corpus(squad=0, mcq=20), dataset_config())
+        findings = {
+            finding.code: finding for finding in audit_dataset(prepared, self.collapsed_sizing())
+        }
+        assert "empty_completion_tokens" in findings
+        assert findings["empty_completion_tokens"].blocking is True
+        assert "BatchEncoding" in findings["empty_completion_tokens"].message
+
+    def test_the_audit_passes_a_healthy_measurement(self):
+        records, tokenizer, config, _ = self.squad_records(8)
+        prepared = prepare_dataset(adapted_corpus(squad=0, mcq=20), dataset_config())
+        per_split = {"train": measure_record_lengths(records, tokenizer, config)}
+        from qa_gen_runtime.sizing import DatasetSizing
+
+        sizing = DatasetSizing(
+            measured=True, splits=per_split, overall=summarize_token_lengths(per_split)
+        )
+        codes = {finding.code for finding in audit_dataset(prepared, sizing)}
+        assert "empty_completion_tokens" not in codes
+        assert "empty_prompt_tokens" not in codes
 
 
 # ---------------------------------------------------------------------------

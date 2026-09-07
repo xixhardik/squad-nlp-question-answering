@@ -89,6 +89,60 @@ class SizingError(RuntimeError):
     """
 
 
+def _token_ids(result: Any, *, what: str) -> list[int]:
+    """Extract a flat list of token ids from whatever ``apply_chat_template`` returned.
+
+    This exists because of a real bug, and the bug is worth recording. transformers 5.x
+    defaults ``apply_chat_template(..., tokenize=True)`` to ``return_dict=True``, so it returns
+    a ``BatchEncoding`` rather than a list of ints. ``len()`` of that mapping is the number of
+    keys -- ``input_ids`` and ``attention_mask``, so **2** -- not the sequence length. A first
+    Phase 17C sizing run over 1,996 real SQuAD records therefore reported a prompt of exactly
+    2 tokens and a completion of exactly 0 for every single example, and a truncation rate of
+    zero, because 2 is comfortably under 1024.
+
+    Taking a length from a shape you did not verify is the whole failure. So the ids are
+    extracted explicitly here rather than by calling ``len()`` on the return value, every
+    branch is handled, and anything unrecognised raises instead of producing a number.
+
+    Args:
+        result: Whatever the tokenizer returned.
+        what: What was being tokenized, for the error message.
+
+    Returns:
+        The token ids.
+
+    Raises:
+        SizingError: If ids cannot be extracted. A raise beats a plausible-looking length: the
+            symptom of getting this wrong is a report full of confident, meaningless numbers.
+    """
+    payload: Any = result
+    if hasattr(payload, "keys"):
+        if "input_ids" not in payload:
+            raise SizingError(
+                f"tokenizing {what} returned a mapping with keys {sorted(payload.keys())} and "
+                "no 'input_ids'. The sizing measurement cannot proceed without the token ids."
+            )
+        payload = payload["input_ids"]
+    if hasattr(payload, "tolist"):
+        payload = payload.tolist()
+    if isinstance(payload, str) or not isinstance(payload, Sequence):
+        raise SizingError(
+            f"tokenizing {what} returned {type(result).__name__}, which is not a sequence of "
+            "token ids. Expected a list of ints, or a mapping carrying 'input_ids'."
+        )
+    if payload and isinstance(payload[0], Sequence) and not isinstance(payload[0], str):
+        # A batch of one. Some processors return lists of lists even for a single example,
+        # which TRL normalises the same way.
+        payload = payload[0]
+    try:
+        return [int(item) for item in payload]
+    except (TypeError, ValueError) as exc:
+        raise SizingError(
+            f"tokenizing {what} returned a sequence that is not token ids: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def _percentile(ordered: Sequence[int], percentile: float) -> int:
     """Return a percentile of an already-sorted sequence, by nearest rank.
 
@@ -475,17 +529,28 @@ def measure_record_lengths(
         if not column:
             missing_template_kwargs += 1
         extra = dict(column or {})
-        prompt_ids = tokenizer.apply_chat_template(
-            [dict(message) for message in prompt],
-            add_generation_prompt=True,
-            tokenize=True,
-            **extra,
+        # return_dict is passed explicitly, exactly as TRL v0.29.1 passes it: False for the
+        # prompt-only rendering, True for the combined one. transformers 5.x defaults it to
+        # True, so omitting it returns a BatchEncoding whose len() is the number of keys.
+        prompt_ids = _token_ids(
+            tokenizer.apply_chat_template(
+                [dict(message) for message in prompt],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=False,
+                **extra,
+            ),
+            what=f"the prompt of record {position} in split {split!r}",
         )
-        full_ids = tokenizer.apply_chat_template(
-            [dict(message) for message in [*prompt, *completion]],
-            add_generation_prompt=False,
-            tokenize=True,
-            **extra,
+        full_ids = _token_ids(
+            tokenizer.apply_chat_template(
+                [dict(message) for message in [*prompt, *completion]],
+                add_generation_prompt=False,
+                tokenize=True,
+                return_dict=True,
+                **extra,
+            ),
+            what=f"record {position} in split {split!r}",
         )
         prompt_length = len(prompt_ids)
         total_length = len(full_ids)
