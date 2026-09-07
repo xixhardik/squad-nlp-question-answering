@@ -70,6 +70,7 @@ import json
 import logging
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from fnmatch import fnmatch
@@ -125,7 +126,9 @@ __all__ = [
     "benchmark_training_overrides",
     "build_parser",
     "check_subset",
+    "estimate_padded_tokens",
     "format_report",
+    "is_out_of_memory",
     "main",
     "project_production_run",
     "resolve_mode",
@@ -137,6 +140,10 @@ __all__ = [
 _EXIT_OK = 0
 _EXIT_ERROR = 1
 _EXIT_CHECKS_FAILED = 3
+
+#: A distinct code for running out of memory, so a script sweeping micro-batch sizes can tell
+#: "this configuration does not fit" apart from "the benchmark is broken" without parsing text.
+_EXIT_OUT_OF_MEMORY = 4
 
 #: Optimiser steps measured by default. Enough that the per-step figure is not dominated by the
 #: first step's one-off costs -- CUDA context, kernel autotuning, the allocator warming up -- and
@@ -195,6 +202,29 @@ class BenchmarkError(RuntimeError):
     """
 
 
+def is_out_of_memory(exc: BaseException) -> bool:
+    """Whether an exception is a CUDA out-of-memory failure.
+
+    Both routes are checked. ``torch.cuda.OutOfMemoryError`` is the modern one and subclasses
+    ``RuntimeError``; older paths and some kernels raise a bare ``RuntimeError`` whose message
+    says "out of memory". Matching on the message alone would be fragile, and matching on the
+    type alone would miss the second case, so both are tried.
+
+    This matters for a micro-batch sweep specifically: "batch 4 does not fit" is a *result*, not
+    a crash, and it has to be recorded as one so the other configurations' numbers stand.
+
+    Args:
+        exc: The exception to classify.
+
+    Returns:
+        ``True`` when it is an out-of-memory failure.
+    """
+    oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_type is not None and isinstance(exc, oom_type):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 class BenchmarkMode(str, Enum):
     """The two things this benchmark can be asked to do.
 
@@ -244,6 +274,69 @@ def subset_size_for(
         if value <= 0:
             raise BenchmarkError(f"{name} must be a positive integer, got {value}.")
     return steps * batch_size * gradient_accumulation_steps
+
+
+def estimate_padded_tokens(lengths: Sequence[int], batch_size: int) -> dict[str, Any]:
+    """Estimate the padded tensor volume a micro-batch size implies.
+
+    Why this is reported at all
+    --------------------------
+    A micro-batch is padded to its longest member, so the work the GPU does is
+    ``max(length) * batch_size`` per micro-batch, not the sum of the lengths. At batch 1 the two
+    are identical and there is no waste. At batch 4 over sequences ranging from 300 to 900
+    tokens the waste is substantial, and it is the whole reason a larger micro-batch can be
+    slower per example than the arithmetic suggests.
+
+    Without this figure, "batch 4 processed examples 1.8x faster" invites the conclusion that
+    batch 4 is 1.8x more efficient, when part of the gain is better GPU occupancy and part of
+    the loss is padding nobody accounted for.
+
+    An estimate, not a measurement
+    ------------------------------
+    The trainer's sampler shuffles, so which lengths actually share a micro-batch is not knowable
+    here. This chunks the subset in record order, which is one plausible grouping of many. The
+    expected overhead is close for a large subset and the exact figure will differ. Labelled as
+    an estimate throughout, for that reason.
+
+    Args:
+        lengths: Every record's total token length.
+        batch_size: Micro-batch per device.
+
+    Returns:
+        A mapping of padding-free tokens, estimated padded tokens, and the overhead between
+        them.
+
+    Raises:
+        BenchmarkError: If ``batch_size`` is not positive.
+    """
+    if batch_size <= 0:
+        raise BenchmarkError(f"batch_size must be a positive integer, got {batch_size}.")
+    if not lengths:
+        return {
+            "batch_size": batch_size,
+            "unpadded_tokens": 0,
+            "estimated_padded_tokens": 0,
+            "estimated_padding_overhead": 0.0,
+            "measured": False,
+            "note": "no lengths were supplied, so no estimate was made",
+        }
+
+    unpadded = sum(lengths)
+    padded = 0
+    for start in range(0, len(lengths), batch_size):
+        chunk = lengths[start : start + batch_size]
+        padded += max(chunk) * len(chunk)
+    return {
+        "batch_size": batch_size,
+        "unpadded_tokens": unpadded,
+        "estimated_padded_tokens": padded,
+        "estimated_padding_overhead": round((padded - unpadded) / unpadded, 4),
+        "measured": False,
+        "note": (
+            "estimated by chunking the subset in record order; the trainer's sampler shuffles, "
+            "so the exact grouping differs. At batch 1 the overhead is zero by construction."
+        ),
+    }
 
 
 def benchmark_training_overrides(
@@ -454,6 +547,12 @@ class BenchmarkMeasurements:
         dropped_trainer_arguments: Settings the installed TRL did not accept.
         warmup_steps: Warmup, after conversion from the ratio.
         adapter_bytes: Size of the saved adapter.
+        padding: Estimated padded tensor volume for this micro-batch size.
+        failed: Whether training raised. ``True`` with ``failure_type`` set to
+            ``"out_of_memory"`` is the expected outcome for a micro-batch that does not fit, and
+            the timing fields are then ``None`` rather than partial.
+        failure_type: ``"out_of_memory"`` or ``None``.
+        failure_message: What the exception said, truncated.
         notes: Anything worth recording.
     """
 
@@ -483,6 +582,10 @@ class BenchmarkMeasurements:
     dropped_trainer_arguments: tuple[str, ...] = ()
     warmup_steps: int = 0
     adapter_bytes: int | None = None
+    padding: dict[str, Any] = field(default_factory=dict)
+    failed: bool = False
+    failure_type: str | None = None
+    failure_message: str | None = None
     notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -522,6 +625,10 @@ class BenchmarkMeasurements:
             "dropped_trainer_arguments": list(self.dropped_trainer_arguments),
             "warmup_steps": self.warmup_steps,
             "adapter_bytes": self.adapter_bytes,
+            "padding": dict(self.padding),
+            "failed": self.failed,
+            "failure_type": self.failure_type,
+            "failure_message": self.failure_message,
             "notes": list(self.notes),
         }
 
@@ -894,6 +1001,9 @@ def run_benchmark(
     production_epochs: int = 2,
     output_dir: str | None = None,
     run_id: str | None = None,
+    label: str | None = None,
+    expect_effective_batch: int | None = None,
+    expect_subset_fingerprint: str | None = None,
 ) -> BenchmarkReport:
     """Measure the real training path, and train only under :attr:`BenchmarkMode.RUN`.
 
@@ -912,12 +1022,21 @@ def run_benchmark(
         production_epochs: Epochs to project.
         output_dir: Where to write. Defaults to ``<artifacts>/qgen-benchmarks``.
         run_id: Override the generated run directory name.
+        label: Short tag prefixed to the generated run directory name, e.g. ``"A"``. For a
+            sweep, so the reports on disk say which configuration each one is.
+        expect_effective_batch: Refuse unless ``batch_size * gradient_accumulation_steps``
+            equals this. The point of a micro-batch comparison is that the effective batch is
+            held constant, and a mistyped accumulation would silently measure a different
+            optimisation problem instead of a different memory layout.
+        expect_subset_fingerprint: Refuse unless the selected subset has this fingerprint.
+            Pass the first configuration's fingerprint into the rest and the comparison is
+            proven to be over identical data rather than assumed to be.
 
     Returns:
         The :class:`BenchmarkReport`.
 
     Raises:
-        BenchmarkError: If the subset cannot be assembled.
+        BenchmarkError: If the subset cannot be assembled, or either expectation fails.
         qa_gen_runtime.config_io.ConfigIOError: If the configuration cannot be read.
         qa_gen.config.GenerationConfigError: If it is invalid.
         qa_gen_runtime.prepared.PreparedDatasetError: If the prepared dataset cannot be read.
@@ -925,6 +1044,16 @@ def run_benchmark(
         qa_gen_runtime.trainer.TrainerBuildError: If the trainer cannot be built.
         qa_gen_runtime.sizing.SizingError: If the subset cannot be measured.
     """
+    effective_batch = batch_size * gradient_accumulation_steps
+    if expect_effective_batch is not None and effective_batch != expect_effective_batch:
+        raise BenchmarkError(
+            f"batch_size {batch_size} x gradient_accumulation_steps "
+            f"{gradient_accumulation_steps} is an effective batch of {effective_batch}, but "
+            f"{expect_effective_batch} was expected. A micro-batch comparison is only "
+            "meaningful with the effective batch held constant; otherwise the configurations "
+            "differ in the optimisation problem as well as the memory layout."
+        )
+
     overrides = benchmark_training_overrides(
         steps=steps,
         batch_size=batch_size,
@@ -945,8 +1074,24 @@ def run_benchmark(
         seed=subset_seed,
     )
 
-    paths = _benchmark_paths(config, root, run_id=run_id, create=mode is BenchmarkMode.RUN)
+    if (
+        expect_subset_fingerprint is not None
+        and subset.fingerprint != expect_subset_fingerprint
+    ):
+        raise BenchmarkError(
+            f"the selected subset has fingerprint {subset.fingerprint!r} but "
+            f"{expect_subset_fingerprint!r} was expected. The comparison would be over "
+            "different data. Check --dataset-fingerprint, --subset-seed and --steps: the "
+            "subset size is steps x batch x accumulation, so holding the effective batch "
+            "constant is what keeps it identical."
+        )
+
+    paths = _benchmark_paths(
+        config, root, run_id=run_id, label=label, create=mode is BenchmarkMode.RUN
+    )
     notes = [
+        f"micro-batch {batch_size} x accumulation {gradient_accumulation_steps} = effective "
+        f"batch {effective_batch}",
         f"mode={mode.value}; trainer.train() is reachable only under {BenchmarkMode.RUN.value}",
         "the configuration file was not modified; the overrides above were applied in memory",
         f"subset drawn from {subset.source_directory} ({subset.source_split} split)",
@@ -1025,14 +1170,29 @@ def run_benchmark(
         plan=plan,
         sizing=sizing,
         requested_steps=steps,
-        effective_batch=batch_size * gradient_accumulation_steps,
+        effective_batch=effective_batch,
+        accum=gradient_accumulation_steps,
     )
     notes.extend(train_notes)
 
     adapter_dir = Path(paths["adapter"])
-    loaded.model.save_pretrained(str(adapter_dir))
+    if measurements.failed:
+        # Nothing usable was trained, so nothing is saved. Writing an adapter from a run that
+        # died partway would leave a checkpoint that looks like the others and is not.
+        findings.append(
+            BenchmarkFinding(
+                code=measurements.failure_type or "training_failed",
+                message=(
+                    f"training did not complete: {measurements.failure_message}. No adapter was "
+                    "saved. Run the other configurations separately; their numbers are "
+                    "unaffected."
+                ),
+            )
+        )
+    else:
+        loaded.model.save_pretrained(str(adapter_dir))
     output_findings, output_details = audit_benchmark_output(
-        adapter_dir, Path(paths["run"]), expect_adapter=True
+        adapter_dir, Path(paths["run"]), expect_adapter=not measurements.failed
     )
     findings.extend(output_findings)
     measurements = _with_adapter_bytes(measurements, output_details.get("adapter_bytes"))
@@ -1051,7 +1211,7 @@ def run_benchmark(
     )
     report = BenchmarkReport(
         mode=mode.value,
-        status="measured",
+        status=measurements.failure_type or "measured",
         trained=True,
         measurements=measurements,
         projection=project_production_run(
@@ -1110,7 +1270,12 @@ def _benchmark_root(output_dir: str | None) -> Path:
 
 
 def _benchmark_paths(
-    config: GenerationExperimentConfig, root: Path, *, run_id: str | None, create: bool
+    config: GenerationExperimentConfig,
+    root: Path,
+    *,
+    run_id: str | None,
+    label: str | None = None,
+    create: bool,
 ) -> dict[str, str]:
     """Decide where this invocation writes.
 
@@ -1118,6 +1283,8 @@ def _benchmark_paths(
         config: The experiment configuration, which generates the run id.
         root: The benchmark root.
         run_id: Override the generated name.
+        label: Short tag prefixed to a generated name, so a sweep's directories are
+            identifiable at a glance.
         create: Create the directory. Only under :attr:`BenchmarkMode.RUN`.
 
     Returns:
@@ -1128,7 +1295,8 @@ def _benchmark_paths(
     """
     from qa_gen_runtime.outputs import ADAPTER_DIRNAME, utc_timestamp
 
-    resolved = run_id or f"bench-{config.run_id(utc_timestamp())}"
+    prefix = f"bench-{label}-" if label else "bench-"
+    resolved = run_id or f"{prefix}{config.run_id(utc_timestamp())}"
     run_dir = root / resolved
     if create:
         if run_dir.exists():
@@ -1150,6 +1318,7 @@ def _train_and_measure(
     sizing: SplitSizing,
     requested_steps: int,
     effective_batch: int,
+    accum: int,
 ) -> tuple[BenchmarkMeasurements, list[str]]:
     """Run the bounded training and measure it.
 
@@ -1161,15 +1330,60 @@ def _train_and_measure(
         sizing: Token-length measurements for the subset.
         requested_steps: Steps that were asked for.
         effective_batch: Examples per optimiser step.
+        accum: Gradient accumulation steps, so the micro-batch size can be recovered for the
+            padding estimate.
 
     Returns:
-        ``(measurements, notes)``.
+        ``(measurements, notes)``. An out-of-memory failure returns rather than raises, with
+        :attr:`BenchmarkMeasurements.failed` set.
     """
     reset = _reset_peak_memory()
     before = memory_report()
+    padding = estimate_padded_tokens(sizing.sequence_lengths, effective_batch // max(1, accum))
 
     started = time.perf_counter()
-    output = _call_trainer_train(trainer, execute=True)
+    try:
+        output = _call_trainer_train(trainer, execute=True)
+    except BaseException as exc:  # noqa: BLE001 - re-raised unless it is an OOM
+        if not is_out_of_memory(exc):
+            raise
+        # A micro-batch that does not fit is a result, not a crash. The peak memory reached
+        # before the failure is the useful part, so it is captured rather than lost.
+        elapsed = time.perf_counter() - started
+        logger.warning("out of memory after %.1fs; recording it as a result", elapsed)
+        return (
+            BenchmarkMeasurements(
+                optimizer_steps=getattr(getattr(trainer, "state", None), "global_step", 0),
+                requested_steps=requested_steps,
+                effective_batch_size=effective_batch,
+                memory_before=before,
+                memory_after=memory_report(),
+                peak_stats_reset=reset,
+                wall_clock_seconds=round(elapsed, 3),
+                trainable_parameters=loaded.trainable_parameters,
+                total_parameters=loaded.total_parameters,
+                trainable_fraction=loaded.trainable_fraction,
+                optimizer_requested=config.training.optimizer,
+                gradient_checkpointing_requested=config.training.gradient_checkpointing,
+                dropped_trainer_arguments=plan.dropped_arguments,
+                warmup_steps=plan.warmup_steps,
+                padding=padding,
+                failed=True,
+                failure_type="out_of_memory",
+                failure_message=str(exc)[:600],
+                notes=(
+                    "this micro-batch size does not fit on this device; the timing fields are "
+                    "absent rather than partial",
+                    "the peak memory figures describe the allocation reached before the "
+                    "failure, which is a lower bound on what the configuration needs",
+                ),
+            ),
+            [
+                f"out of memory at batch {effective_batch // max(1, accum)} "
+                f"(effective {effective_batch}); recorded as a result so the other "
+                "configurations' numbers stand"
+            ],
+        )
     elapsed = time.perf_counter() - started
 
     after = memory_report()
@@ -1244,6 +1458,7 @@ def _train_and_measure(
             use_cache=getattr(getattr(loaded.model, "config", None), "use_cache", None),
             dropped_trainer_arguments=plan.dropped_arguments,
             warmup_steps=plan.warmup_steps,
+            padding=padding,
             notes=tuple(notes),
         ),
         notes,
@@ -1420,6 +1635,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-id", default=None, help="Override the run directory name.")
     parser.add_argument(
+        "--label",
+        default=None,
+        help=(
+            "Short tag prefixed to the run directory, e.g. --label A. For a micro-batch sweep, "
+            "so the reports on disk say which configuration each one is."
+        ),
+    )
+    parser.add_argument(
+        "--expect-effective-batch",
+        type=int,
+        default=None,
+        help=(
+            "Refuse unless batch-size x gradient-accumulation-steps equals this. Use it for a "
+            "micro-batch comparison: the whole point is that the effective batch is held "
+            "constant, and a mistyped accumulation would measure a different optimisation "
+            "problem rather than a different memory layout."
+        ),
+    )
+    parser.add_argument(
+        "--expect-subset-fingerprint",
+        default=None,
+        help=(
+            "Refuse unless the selected subset has this fingerprint. Pass the first "
+            "configuration's fingerprint into the rest and the comparison is proven to be over "
+            "identical data."
+        ),
+    )
+    parser.add_argument(
         "--report", default=None, help="Also write the JSON report to this path."
     )
     parser.add_argument(
@@ -1566,6 +1809,21 @@ def format_report(report: BenchmarkReport) -> str:
 def _format_measurements(measured: BenchmarkMeasurements) -> list[str]:
     """Render the measurement section."""
     after = measured.memory_after
+    if measured.failed:
+        return [
+            "",
+            "[ FAILED ]",
+            f"  failure             {measured.failure_type}",
+            f"  after               {measured.wall_clock_seconds} s",
+            f"  effective batch     {measured.effective_batch_size}",
+            f"  vram peak alloc     {after.get('max_allocated_gib')} GiB (lower bound)",
+            f"  vram peak reserved  {after.get('max_reserved_gib')} GiB (lower bound)",
+            f"  vram total          {after.get('total_vram_gib')} GiB",
+            f"  message             {(measured.failure_message or '')[:160]}",
+            "  no adapter was saved and no timing figure is reported",
+        ]
+
+    padding = measured.padding
     lines = [
         "",
         "[ MEASURED ]",
@@ -1575,9 +1833,14 @@ def _format_measurements(measured: BenchmarkMeasurements) -> list[str]:
         f"  examples processed  {measured.examples_processed:,}"
         if measured.examples_processed is not None
         else "  examples processed  (unknown)",
-        f"  tokens processed    {measured.tokens_processed:,}"
+        f"  tokens processed    {measured.tokens_processed:,} (padding-free)"
         if measured.tokens_processed is not None
         else "  tokens processed    (unknown)",
+        f"  padded tokens ~     {padding.get('estimated_padded_tokens'):,} "
+        f"(+{100 * padding.get('estimated_padding_overhead', 0.0):.1f}% estimated padding "
+        f"at micro-batch {padding.get('batch_size')})"
+        if padding.get("estimated_padded_tokens")
+        else "  padded tokens ~     (not estimated)",
         f"  wall clock          {measured.wall_clock_seconds} s",
         f"  seconds/step        {measured.seconds_per_optimizer_step}",
         f"  examples/second     {measured.examples_per_second}",
@@ -1651,6 +1914,9 @@ def main(argv: list[str] | None = None) -> int:
             production_epochs=args.production_epochs,
             output_dir=args.output_dir,
             run_id=args.run_id,
+            label=args.label,
+            expect_effective_batch=args.expect_effective_batch,
+            expect_subset_fingerprint=args.expect_subset_fingerprint,
         )
     except (
         BenchmarkError,
@@ -1676,6 +1942,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report.as_dict(), indent=2, ensure_ascii=False, default=str))
     else:
         print(format_report(report))
+
+    if report.measurements is not None and report.measurements.failure_type == "out_of_memory":
+        print(
+            "\nout of memory: this micro-batch size does not fit on this device. The report was "
+            "written and records the peak allocation reached before the failure. The other "
+            "configurations are unaffected -- run each one as a separate invocation.",
+            file=sys.stderr,
+        )
+        return _EXIT_OUT_OF_MEMORY
 
     if not report.ok:
         blocking = [finding.code for finding in report.findings if finding.blocking]

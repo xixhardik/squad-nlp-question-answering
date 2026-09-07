@@ -364,6 +364,12 @@ class SplitSizing:
             reasoning flag is passed. A non-zero count on a real run means the records were
             built without a tokenizer, and the completion lengths are overstated by four
             tokens each.
+        sequence_lengths: Every record's total length, in record order. Retained in memory and
+            deliberately **not** serialized -- 78,552 integers would dominate a report that is
+            meant to be read. A caller needs them to reason about anything the summaries
+            cannot express, and intra-batch padding is the example: padding waste depends on
+            which lengths land in a micro-batch together, so it cannot be recovered from a mean
+            and a maximum.
     """
 
     split: str
@@ -374,6 +380,11 @@ class SplitSizing:
     truncated: int = 0
     max_seq_length: int = 0
     records_missing_template_kwargs: int = 0
+    sequence_lengths: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Coerce the sequence fields to tuples."""
+        object.__setattr__(self, "sequence_lengths", tuple(self.sequence_lengths))
 
     @property
     def truncation_rate(self) -> float:
@@ -569,6 +580,7 @@ def measure_record_lengths(
         truncated=truncated,
         max_seq_length=limit,
         records_missing_template_kwargs=missing_template_kwargs,
+        sequence_lengths=tuple(total_lengths),
     )
 
 
@@ -616,6 +628,9 @@ def summarize_token_lengths(per_split: dict[str, SplitSizing]) -> SplitSizing:
         max_seq_length=max(sizing.max_seq_length for sizing in populated),
         records_missing_template_kwargs=sum(
             sizing.records_missing_template_kwargs for sizing in populated
+        ),
+        sequence_lengths=tuple(
+            length for sizing in populated for length in sizing.sequence_lengths
         ),
     )
 

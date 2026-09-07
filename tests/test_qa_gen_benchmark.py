@@ -61,6 +61,7 @@ from qa_gen_runtime.benchmark import (
     benchmark_training_overrides,
     build_parser,
     check_subset,
+    estimate_padded_tokens,
     format_report,
     main,
     project_production_run,
@@ -1125,6 +1126,505 @@ class TestRunMode:
     def test_the_notes_warn_about_reading_the_loss(self, stack, prepared):
         report = self.invoke(prepared)
         assert any("loss curve does not" in note for note in report.notes)
+
+
+class TestMicrobatchComparison:
+    """A/B/C at a constant effective batch of 8: the same data, three memory layouts."""
+
+    CONFIGURATIONS = (("A", 1, 8), ("B", 2, 4), ("C", 4, 2))
+
+    def test_every_configuration_has_the_same_effective_batch(self):
+        for label, batch, accum in self.CONFIGURATIONS:
+            assert batch * accum == 8, label
+
+    def test_every_configuration_consumes_the_same_subset_size(self):
+        sizes = {
+            label: subset_size_for(
+                50, batch_size=batch, gradient_accumulation_steps=accum
+            )
+            for label, batch, accum in self.CONFIGURATIONS
+        }
+        assert set(sizes.values()) == {400}, sizes
+
+    def test_every_configuration_selects_the_identical_subset(self, prepared):
+        """The property the whole comparison rests on, asserted rather than assumed."""
+        subsets = {}
+        for label, batch, accum in self.CONFIGURATIONS:
+            size = subset_size_for(50, batch_size=batch, gradient_accumulation_steps=accum)
+            subsets[label] = select_benchmark_subset(prepared.dataset_root, size=size)
+        fingerprints = {label: subset.fingerprint for label, subset in subsets.items()}
+        assert len(set(fingerprints.values())) == 1, fingerprints
+        ids = {label: [i.id for i in subset.examples] for label, subset in subsets.items()}
+        assert ids["A"] == ids["B"] == ids["C"]
+
+    def test_the_effective_batch_guard_accepts_every_configuration(self, stack, prepared):
+        for label, batch, accum in self.CONFIGURATIONS:
+            report = run_benchmark(
+                str(prepared.config),
+                mode=BenchmarkMode.INSPECT_ONLY,
+                steps=5,
+                batch_size=batch,
+                gradient_accumulation_steps=accum,
+                expect_effective_batch=batch * accum,
+                output_dir=str(prepared.output),
+                label=label,
+            )
+            assert report.measurements is None
+            assert report.overrides["training"]["per_device_train_batch_size"] == batch
+            assert report.overrides["training"]["gradient_accumulation_steps"] == accum
+
+    def test_the_effective_batch_guard_refuses_a_mismatch(self, stack, prepared):
+        """A mistyped accumulation would measure a different optimisation problem."""
+        with pytest.raises(BenchmarkError, match="effective batch of 4"):
+            run_benchmark(
+                str(prepared.config),
+                mode=BenchmarkMode.INSPECT_ONLY,
+                steps=5,
+                batch_size=2,
+                gradient_accumulation_steps=2,
+                expect_effective_batch=8,
+                output_dir=str(prepared.output),
+            )
+
+    def test_the_subset_fingerprint_guard_accepts_a_match(self, stack, prepared):
+        first = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.INSPECT_ONLY,
+            steps=5,
+            batch_size=1,
+            gradient_accumulation_steps=8,
+            output_dir=str(prepared.output),
+        )
+        second = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.INSPECT_ONLY,
+            steps=5,
+            batch_size=4,
+            gradient_accumulation_steps=2,
+            expect_subset_fingerprint=first.subset.fingerprint,
+            output_dir=str(prepared.output),
+        )
+        assert second.subset.fingerprint == first.subset.fingerprint
+
+    def test_the_subset_fingerprint_guard_refuses_a_mismatch(self, stack, prepared):
+        with pytest.raises(BenchmarkError, match="different data"):
+            run_benchmark(
+                str(prepared.config),
+                mode=BenchmarkMode.INSPECT_ONLY,
+                steps=5,
+                expect_subset_fingerprint="deadbeefdeadbeef",
+                output_dir=str(prepared.output),
+            )
+
+    def test_a_changed_step_count_changes_the_subset_and_is_caught(self, stack, prepared):
+        """Holding the effective batch constant is what keeps the subset identical."""
+        first = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.INSPECT_ONLY,
+            steps=5,
+            output_dir=str(prepared.output),
+        )
+        with pytest.raises(BenchmarkError, match="different data"):
+            run_benchmark(
+                str(prepared.config),
+                mode=BenchmarkMode.INSPECT_ONLY,
+                steps=6,
+                expect_subset_fingerprint=first.subset.fingerprint,
+                output_dir=str(prepared.output),
+            )
+
+    def test_the_label_names_the_run_directory(self, stack, prepared):
+        run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            output_dir=str(prepared.output),
+            label="B",
+        )
+        directories = [item.name for item in prepared.output.iterdir()]
+        assert len(directories) == 1
+        assert directories[0].startswith("bench-B-")
+
+    def test_the_notes_state_the_microbatch_arithmetic(self, stack, prepared):
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.INSPECT_ONLY,
+            steps=5,
+            batch_size=4,
+            gradient_accumulation_steps=2,
+            output_dir=str(prepared.output),
+        )
+        assert any(
+            "micro-batch 4 x accumulation 2 = effective batch 8" in note
+            for note in report.notes
+        )
+
+    def test_the_reported_effective_batch_matches(self, stack, prepared):
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            batch_size=2,
+            gradient_accumulation_steps=4,
+            output_dir=str(prepared.output),
+            label="B",
+        )
+        assert report.measurements.effective_batch_size == 8
+        assert report.measurements.examples_processed == 32
+
+
+class TestPaddingEstimate:
+    """Why a larger micro-batch is not automatically more efficient."""
+
+    def test_batch_one_has_no_padding_overhead(self):
+        estimate = estimate_padded_tokens([100, 500, 300], batch_size=1)
+        assert estimate["unpadded_tokens"] == 900
+        assert estimate["estimated_padded_tokens"] == 900
+        assert estimate["estimated_padding_overhead"] == 0.0
+
+    def test_a_larger_batch_pads_to_the_longest_member(self):
+        estimate = estimate_padded_tokens([100, 500], batch_size=2)
+        assert estimate["unpadded_tokens"] == 600
+        assert estimate["estimated_padded_tokens"] == 1000
+        assert estimate["estimated_padding_overhead"] == pytest.approx(0.6667, abs=1e-4)
+
+    def test_a_ragged_final_batch_is_handled(self):
+        estimate = estimate_padded_tokens([100, 200, 300], batch_size=2)
+        assert estimate["estimated_padded_tokens"] == 400 + 300
+
+    def test_uniform_lengths_pad_to_nothing(self):
+        estimate = estimate_padded_tokens([400] * 8, batch_size=4)
+        assert estimate["estimated_padding_overhead"] == 0.0
+
+    def test_overhead_grows_with_the_micro_batch(self):
+        lengths = [200, 400, 600, 800] * 8
+        overheads = [
+            estimate_padded_tokens(lengths, batch_size=size)["estimated_padding_overhead"]
+            for size in (1, 2, 4)
+        ]
+        assert overheads[0] == 0.0
+        assert overheads[0] < overheads[1] < overheads[2]
+
+    def test_it_is_labelled_an_estimate(self):
+        estimate = estimate_padded_tokens([100, 200], batch_size=2)
+        assert estimate["measured"] is False
+        assert "sampler shuffles" in estimate["note"]
+
+    def test_no_lengths_yields_no_estimate(self):
+        estimate = estimate_padded_tokens([], batch_size=4)
+        assert estimate["estimated_padded_tokens"] == 0
+        assert estimate["measured"] is False
+
+    def test_a_non_positive_batch_is_refused(self):
+        with pytest.raises(BenchmarkError, match="positive integer"):
+            estimate_padded_tokens([100], batch_size=0)
+
+    def test_the_lengths_are_retained_but_not_serialized(self, stack, prepared):
+        """Needed in memory for the padding estimate; 78k integers must not reach a report."""
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.INSPECT_ONLY,
+            steps=5,
+            output_dir=str(prepared.output),
+        )
+        assert len(report.sizing.sequence_lengths) == 40
+        assert "sequence_lengths" not in report.sizing.as_dict()
+
+    def test_the_padding_estimate_reaches_the_report(self, stack, prepared):
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            batch_size=4,
+            gradient_accumulation_steps=2,
+            output_dir=str(prepared.output),
+            label="C",
+        )
+        padding = report.measurements.padding
+        assert padding["batch_size"] == 4
+        assert padding["estimated_padded_tokens"] >= padding["unpadded_tokens"]
+        assert padding["unpadded_tokens"] == report.measurements.tokens_processed
+
+
+class TestOutOfMemoryHandling:
+    """A micro-batch that does not fit is a result, not a crash."""
+
+    def oom_stack(self, monkeypatch, prepared, *, exception: BaseException):
+        """Patch the trainer so training raises ``exception``."""
+        tokenizer = FakeTokenizer()
+        model = FakeAdaptedModel()
+
+        def fake_load(config):
+            return LoadedModel(
+                model=model,
+                tokenizer=tokenizer,
+                precision=resolve_precision("fp32"),
+                trainable_parameters=33_030_144,
+                total_parameters=4_055_498_240,
+                adapters_attached=True,
+            )
+
+        class ExplodingTrainer(FakeTrainer):
+            """Raises instead of training."""
+
+            def train(self):
+                self.train_calls += 1
+                raise exception
+
+        def fake_build_trainer(config, *, model, tokenizer, train_dataset, output_dir, **kw):
+            return ExplodingTrainer(list(train_dataset)), plan_trainer_arguments(
+                config, output_dir, train_examples=len(train_dataset)
+            )
+
+        monkeypatch.setattr(benchmark_module, "load_trainable_model", fake_load)
+        monkeypatch.setattr(benchmark_module, "build_hf_dataset", list)
+        monkeypatch.setattr(benchmark_module, "build_trainer", fake_build_trainer)
+        monkeypatch.setattr(benchmark_module, "_dataset_root", lambda: prepared.dataset_root)
+        return model
+
+    def test_a_torch_oom_is_recognised(self):
+        import torch
+
+        assert benchmark_module.is_out_of_memory(torch.cuda.OutOfMemoryError("CUDA oom"))
+
+    def test_a_runtime_error_mentioning_oom_is_recognised(self):
+        assert benchmark_module.is_out_of_memory(
+            RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        )
+
+    def test_an_unrelated_error_is_not_recognised(self):
+        assert not benchmark_module.is_out_of_memory(RuntimeError("shape mismatch"))
+        assert not benchmark_module.is_out_of_memory(ValueError("out of memory"))
+
+    def test_an_oom_is_recorded_rather_than_raised(self, monkeypatch, prepared):
+        import torch
+
+        self.oom_stack(
+            monkeypatch, prepared, exception=torch.cuda.OutOfMemoryError("CUDA out of memory")
+        )
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            batch_size=4,
+            gradient_accumulation_steps=2,
+            output_dir=str(prepared.output),
+            label="C",
+        )
+        assert report.status == "out_of_memory"
+        assert report.measurements.failed is True
+        assert report.measurements.failure_type == "out_of_memory"
+        assert "out of memory" in report.measurements.failure_message.lower()
+
+    def test_no_timing_is_reported_for_a_failed_run(self, monkeypatch, prepared):
+        self.oom_stack(monkeypatch, prepared, exception=RuntimeError("CUDA out of memory"))
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            output_dir=str(prepared.output),
+        )
+        measured = report.measurements
+        assert measured.seconds_per_optimizer_step is None
+        assert measured.examples_per_second is None
+        assert measured.tokens_per_second is None
+        assert measured.final_loss is None
+
+    def test_the_peak_memory_is_still_captured(self, monkeypatch, prepared):
+        self.oom_stack(monkeypatch, prepared, exception=RuntimeError("CUDA out of memory"))
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            output_dir=str(prepared.output),
+        )
+        assert "max_allocated_gib" in report.measurements.memory_after
+        assert any("lower bound" in note for note in report.measurements.notes)
+
+    def test_no_adapter_is_saved_after_a_failure(self, monkeypatch, prepared):
+        model = self.oom_stack(
+            monkeypatch, prepared, exception=RuntimeError("CUDA out of memory")
+        )
+        run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            output_dir=str(prepared.output),
+            run_id="oom-run",
+        )
+        assert model.saved_to is None
+        assert not (prepared.output / "oom-run" / "adapter").exists()
+
+    def test_the_failure_is_a_blocking_finding(self, monkeypatch, prepared):
+        self.oom_stack(monkeypatch, prepared, exception=RuntimeError("CUDA out of memory"))
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            output_dir=str(prepared.output),
+        )
+        codes = {finding.code for finding in report.findings}
+        assert "out_of_memory" in codes
+        assert report.ok is False
+
+    def test_the_report_is_still_written(self, monkeypatch, prepared):
+        self.oom_stack(monkeypatch, prepared, exception=RuntimeError("CUDA out of memory"))
+        run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            output_dir=str(prepared.output),
+            run_id="oom-report",
+        )
+        path = prepared.output / "oom-report" / BENCHMARK_REPORT_FILENAME
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["status"] == "out_of_memory"
+        assert payload["measurements"]["failed"] is True
+
+    def test_an_unrelated_error_still_propagates(self, monkeypatch, prepared):
+        """Only OOM is absorbed; a real bug must not be reported as a memory limit."""
+        self.oom_stack(monkeypatch, prepared, exception=RuntimeError("shape mismatch"))
+        with pytest.raises(RuntimeError, match="shape mismatch"):
+            run_benchmark(
+                str(prepared.config),
+                mode=BenchmarkMode.RUN,
+                steps=4,
+                output_dir=str(prepared.output),
+            )
+
+    def test_the_cli_exits_four_on_oom(self, monkeypatch, prepared, capsys):
+        """A distinct code so a sweep can tell 'does not fit' from 'is broken'."""
+        self.oom_stack(monkeypatch, prepared, exception=RuntimeError("CUDA out of memory"))
+        code = main(
+            [
+                "--config",
+                str(prepared.config),
+                "--run",
+                "--steps",
+                "4",
+                "--output-dir",
+                str(prepared.output),
+                "--run-id",
+                "oom-cli",
+                "--log-level",
+                "CRITICAL",
+            ]
+        )
+        captured = capsys.readouterr()
+        assert code == 4
+        assert "does not fit" in captured.err
+        assert "[ FAILED ]" in captured.out
+
+    def test_the_text_report_omits_a_timing_figure_after_a_failure(
+        self, monkeypatch, prepared
+    ):
+        self.oom_stack(monkeypatch, prepared, exception=RuntimeError("CUDA out of memory"))
+        report = run_benchmark(
+            str(prepared.config),
+            mode=BenchmarkMode.RUN,
+            steps=4,
+            output_dir=str(prepared.output),
+        )
+        text = format_report(report)
+        assert "[ FAILED ]" in text
+        assert "[ MEASURED ]" not in text
+        assert "no adapter was saved" in text
+
+
+class TestCliMicrobatchArguments:
+    """The new flags, and that they default to the measured baseline."""
+
+    def test_the_batch_flags_are_configurable(self):
+        args = build_parser().parse_args(
+            [
+                "--config",
+                "c.yaml",
+                "--run",
+                "--batch-size",
+                "4",
+                "--gradient-accumulation-steps",
+                "2",
+            ]
+        )
+        assert args.batch_size == 4
+        assert args.gradient_accumulation_steps == 2
+
+    def test_the_new_guards_default_to_absent(self):
+        args = build_parser().parse_args(["--config", "c.yaml", "--run"])
+        assert args.expect_effective_batch is None
+        assert args.expect_subset_fingerprint is None
+        assert args.label is None
+
+    def test_the_guards_are_parsed(self):
+        args = build_parser().parse_args(
+            [
+                "--config",
+                "c.yaml",
+                "--run",
+                "--label",
+                "C",
+                "--expect-effective-batch",
+                "8",
+                "--expect-subset-fingerprint",
+                "abc123",
+            ]
+        )
+        assert args.label == "C"
+        assert args.expect_effective_batch == 8
+        assert args.expect_subset_fingerprint == "abc123"
+
+    def test_a_guard_violation_exits_one(self, stack, prepared, capsys):
+        code = main(
+            [
+                "--config",
+                str(prepared.config),
+                "--inspect-only",
+                "--steps",
+                "4",
+                "--batch-size",
+                "2",
+                "--gradient-accumulation-steps",
+                "2",
+                "--expect-effective-batch",
+                "8",
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        assert code == 1
+        assert "effective batch of 4" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(("label", "batch", "accum"), [("A", 1, 8), ("B", 2, 4), ("C", 4, 2)])
+    def test_each_configuration_runs_through_the_cli(
+        self, stack, prepared, capsys, label, batch, accum
+    ):
+        code = main(
+            [
+                "--config",
+                str(prepared.config),
+                "--run",
+                "--steps",
+                "4",
+                "--batch-size",
+                str(batch),
+                "--gradient-accumulation-steps",
+                str(accum),
+                "--expect-effective-batch",
+                "8",
+                "--label",
+                label,
+                "--json",
+                "--output-dir",
+                str(prepared.output),
+                "--log-level",
+                "WARNING",
+            ]
+        )
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["measurements"]["effective_batch_size"] == 8
+        assert payload["measurements"]["padding"]["batch_size"] == batch
+        assert payload["subset"]["examples"] == 4 * batch * accum
 
 
 class TestReportSerialization:
