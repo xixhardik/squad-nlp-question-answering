@@ -64,13 +64,16 @@ Modules
 - :mod:`qa_gen_runtime.diagnostics`  - what ran, on what, with which settings
 - :mod:`qa_gen_runtime.outputs`      - run directories, already git-ignored
 - :mod:`qa_gen_runtime.config_io`    - YAML and JSON configuration loading
+- :mod:`qa_gen_runtime.sources`      - reading corpora; downloads are opt-in, never implicit
+- :mod:`qa_gen_runtime.sizing`       - real-tokenizer length statistics and step estimation
 - :mod:`qa_gen_runtime.train`        - the CLI, which validates by default
 - :mod:`qa_gen_runtime.smoke_data`   - six hand-written examples, downloaded from nowhere
 - :mod:`qa_gen_runtime.smoke`        - the bounded smoke harness; the one ``train()`` call
+- :mod:`qa_gen_runtime.prepare`      - the CLI that prepares and sizes the real dataset
 
-The two CLI modules are not re-exported below. ``python -m qa_gen_runtime.train`` and
-``python -m qa_gen_runtime.smoke`` are how they are used, and importing
-:mod:`qa_gen_runtime` should not pull an argument parser in behind it.
+The three CLI modules are not re-exported below. ``python -m qa_gen_runtime.train``,
+``python -m qa_gen_runtime.smoke`` and ``python -m qa_gen_runtime.prepare`` are how they are
+used, and importing :mod:`qa_gen_runtime` should not pull an argument parser in behind it.
 """
 
 from qa_gen_runtime.chat import (
@@ -140,6 +143,31 @@ from qa_gen_runtime.quantization import (
     build_quantization_config,
     describe_quantization,
 )
+from qa_gen_runtime.sizing import (
+    DEFAULT_STEP_PLANS,
+    DatasetSizing,
+    SizingError,
+    SplitSizing,
+    StepEstimate,
+    TokenLengthSummary,
+    build_step_estimates,
+    estimate_step_count,
+    estimate_tokenization_seconds,
+    load_sizing_tokenizer,
+    measure_record_lengths,
+    summarize_token_lengths,
+)
+from qa_gen_runtime.sources import (
+    SOURCE_CATALOGUE,
+    LoadedSource,
+    SourceLoadError,
+    SourceRequest,
+    adapt_source,
+    catalogue_entry,
+    describe_catalogue,
+    load_source_records,
+    resolve_requests,
+)
 from qa_gen_runtime.trainer import (
     TrainerBuildError,
     TrainerPlan,
@@ -153,12 +181,16 @@ __version__ = "0.1.0"
 
 __all__ = [
     "CHAT_TEMPLATE_KWARGS_COLUMN",
+    "DEFAULT_STEP_PLANS",
     "DTYPE_NAMES",
     "OPTIONAL_DEPENDENCIES",
     "REASONING_TEMPLATE_FLAG",
+    "SOURCE_CATALOGUE",
     "ConfigIOError",
     "DatasetBuildError",
+    "DatasetSizing",
     "LoadedModel",
+    "LoadedSource",
     "ModelLoadError",
     "PrecisionError",
     "PrecisionPlan",
@@ -168,10 +200,17 @@ __all__ = [
     "RunPaths",
     "RuntimeDependencyError",
     "RuntimeDiagnostics",
+    "SizingError",
+    "SourceLoadError",
+    "SourceRequest",
+    "SplitSizing",
+    "StepEstimate",
+    "TokenLengthSummary",
     "TrainerBuildError",
     "TrainerPlan",
     "TrainingRecordBuilder",
     "__version__",
+    "adapt_source",
     "apply_chat_template",
     "attach_adapters",
     "attach_to_metadata",
@@ -180,22 +219,30 @@ __all__ = [
     "build_model_kwargs",
     "build_quantization_config",
     "build_sft_config",
+    "build_step_estimates",
     "build_trainer",
     "build_training_records",
+    "catalogue_entry",
     "chat_template_kwargs",
     "collect_diagnostics",
     "count_parameters",
     "create_run_directory",
     "dependency_report",
+    "describe_catalogue",
     "describe_chat_handling",
     "describe_device",
     "describe_quantization",
+    "estimate_step_count",
+    "estimate_tokenization_seconds",
     "is_available",
     "load_base_model",
     "load_experiment_config",
     "load_mapping",
+    "load_sizing_tokenizer",
+    "load_source_records",
     "load_tokenizer",
     "load_trainable_model",
+    "measure_record_lengths",
     "memory_report",
     "plan_trainer_arguments",
     "require_peft",
@@ -203,8 +250,10 @@ __all__ = [
     "resolve_dtype",
     "resolve_precision",
     "resolve_record_format",
+    "resolve_requests",
     "resolve_run_root",
     "resolve_warmup_steps",
+    "summarize_token_lengths",
     "template_supports_reasoning_flag",
     "utc_timestamp",
     "write_resolved_config",

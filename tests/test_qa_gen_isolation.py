@@ -54,6 +54,7 @@ SUBMODULES = (
     "statistics",
     "metadata",
     "serialization",
+    "preparation",
 )
 
 
