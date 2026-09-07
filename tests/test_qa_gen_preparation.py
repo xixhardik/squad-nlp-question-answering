@@ -2273,6 +2273,191 @@ class TestNoModelWeightsAreLoaded:
             load_sizing_tokenizer(experiment_config())
 
 
+class TestShippedQgenConfigs:
+    """The two production corpus configurations, and how they differ.
+
+    ``qgen-squad.yaml`` and ``qgen-learningq.yaml`` exist to be compared: the same base model,
+    the same QLoRA settings and the same schedule over two corpora with very different question
+    registers. That comparison is only meaningful if the training stack really is identical, so
+    it is asserted here rather than maintained by hand.
+    """
+
+    def config_path(self, name: str) -> str:
+        """Path to a shipped generative configuration."""
+        from qa_ml.paths import find_repo_root
+
+        return str(find_repo_root() / "ml" / "configs" / "qgen" / name)
+
+    def load(self, name: str):
+        """Load and validate a shipped generative configuration."""
+        from qa_gen_runtime.config_io import load_experiment_config
+
+        config = load_experiment_config(self.config_path(name))
+        config.validate()
+        return config
+
+    def test_the_learningq_config_loads_and_validates(self):
+        config = self.load("qgen-learningq.yaml")
+        assert config.name == "qgen-learningq"
+        assert config.phase == "17"
+
+    def test_learningq_is_the_only_source(self):
+        assert self.load("qgen-learningq.yaml").dataset.sources == ("learningq-qg",)
+
+    def test_the_source_is_a_registered_adapter(self):
+        from qa_gen import registered_sources
+
+        for source in self.load("qgen-learningq.yaml").dataset.sources:
+            assert source in registered_sources()
+
+    def test_the_training_stack_is_identical_to_the_squad_config(self):
+        """The point of a second corpus config: only the corpus may differ."""
+        squad = self.load("qgen-squad.yaml")
+        learningq = self.load("qgen-learningq.yaml")
+        assert learningq.model == squad.model
+        assert learningq.lora == squad.lora
+        assert learningq.training == squad.training
+
+    def test_only_the_dataset_section_differs(self):
+        squad = self.load("qgen-squad.yaml")
+        learningq = self.load("qgen-learningq.yaml")
+        assert learningq.dataset != squad.dataset
+        assert learningq.config_hash() != squad.config_hash()
+
+    def test_the_qlora_settings_are_the_measured_ones(self):
+        config = self.load("qgen-learningq.yaml")
+        assert config.model.model_id == "Qwen/Qwen3-4B"
+        assert config.model.quantization == "4bit"
+        assert config.model.quantization_type == "nf4"
+        assert config.model.double_quantization is True
+        assert config.model.compute_dtype == "bf16"
+        assert config.model.max_seq_length == 1024
+        assert config.model.reasoning_mode == "disabled"
+        assert config.training.optimizer == "paged_adamw_8bit"
+        assert config.training.gradient_checkpointing is True
+        assert config.training.completion_only_loss is True
+        assert config.training.packing is False
+
+    def test_the_learningq_config_matches_the_verified_baseline(self):
+        from qa_gen import VERIFIED_QWEN3_4B_L4
+
+        config = self.load("qgen-learningq.yaml")
+        assert config.baseline_deviations(VERIFIED_QWEN3_4B_L4) == ()
+
+    def test_the_context_bound_leaves_room_for_a_long_answer(self):
+        """LearningQ targets are marks=5 descriptive answers; the target must not truncate."""
+        squad = self.load("qgen-squad.yaml")
+        learningq = self.load("qgen-learningq.yaml")
+        assert learningq.dataset.max_context_chars < squad.dataset.max_context_chars
+        assert learningq.dataset.max_context_chars == 2000
+        assert learningq.dataset.min_context_chars == 64
+
+    def test_the_grouping_keeps_a_source_document_whole(self):
+        """The adapter sets group_key="doc:<id>", which effective_group_key prefers."""
+        config = self.load("qgen-learningq.yaml")
+        assert config.dataset.group_by == "context"
+        record = {
+            "context": PASSAGE,
+            "question": "Explain how chlorophyll captures light energy.",
+            "answer": "Chlorophyll absorbs photons and transfers the energy to the "
+            "photosystem reaction centre.",
+            "doc_id": "khan-1234",
+        }
+        item = next(iter(adapt_records("learningq-qg", [record])))
+        assert item.group_key == "doc:khan-1234"
+        assert item.effective_group_key() == "doc:khan-1234"
+
+    def test_the_adapter_assigns_the_long_answer_shape(self):
+        record = {
+            "context": PASSAGE,
+            "question": "Explain how chlorophyll captures light energy.",
+            "answer": "Chlorophyll absorbs photons and transfers the energy onward.",
+            "doc_id": "khan-1",
+        }
+        item = next(iter(adapt_records("learningq-qg", [record])))
+        assert item.source == "learningq-qg"
+        assert item.targets[0].question_type is QuestionType.LONG_ANSWER
+        assert item.targets[0].difficulty is Difficulty.MEDIUM
+        assert item.targets[0].marks == 5
+
+    def test_a_real_run_refuses_without_a_local_path(self):
+        """LearningQ has no Hub mirror, so the requirement must fail loudly and say how."""
+        config = self.load("qgen-learningq.yaml")
+        with pytest.raises(SourceLoadError, match="--source-path learningq-qg"):
+            resolve_requests(config.dataset.sources)
+
+    def test_a_plan_reports_the_requirement_rather_than_failing(self):
+        config = self.load("qgen-learningq.yaml")
+        requests = resolve_requests(config.dataset.sources, require_readable=False)
+        assert len(requests) == 1
+        assert not request_is_readable(requests[0])
+        assert "needs --source-path learningq-qg" in describe_requirements(requests)[0]
+
+    def test_a_local_path_makes_it_readable(self):
+        config = self.load("qgen-learningq.yaml")
+        requests = resolve_requests(
+            config.dataset.sources,
+            local_paths={"learningq-qg": "data/learningq.jsonl"},
+        )
+        assert requests[0].local_path == "data/learningq.jsonl"
+        assert requests[0].dataset_id == ""
+        assert request_is_readable(requests[0])
+        assert "reads the local file" in describe_requirements(requests)[0]
+
+    def test_answer_free_records_are_dropped_not_fatal(self):
+        """Most LearningQ items have no written answer; strict mode must stay off."""
+        request = SourceRequest("learningq-qg", local_path="learningq.jsonl")
+        records = [
+            {
+                "context": PASSAGE,
+                "question": "Explain photosynthesis.",
+                "answer": "Chlorophyll absorbs light and drives the reaction.",
+                "doc_id": "d1",
+            },
+            {"context": PASSAGE, "question": "Why is the sky blue?", "doc_id": "d2"},
+            {"context": PASSAGE, "question": "Discuss respiration.", "answer": "", "doc_id": "d3"},
+        ]
+        loaded = adapt_source(request, records, skip_invalid=True)
+        assert len(loaded.examples) == 1
+        assert loaded.ingestion.rejected == 2
+        assert loaded.ingestion.rejection_rate == round(2 / 3, 4)
+        assert any("written answer" in message for message in loaded.rejection_messages)
+
+    def test_strict_adapters_would_make_the_first_refusal_fatal(self):
+        """Why the config documents not passing --strict-adapters for this corpus."""
+        from qa_gen import AdapterError
+
+        request = SourceRequest("learningq-qg", local_path="learningq.jsonl")
+        with pytest.raises(AdapterError, match="written answer"):
+            adapt_source(
+                request,
+                [{"context": PASSAGE, "question": "Why?", "doc_id": "d"}],
+                skip_invalid=False,
+            )
+
+    def test_strict_adapters_is_off_by_default_on_the_cli(self):
+        args = build_parser().parse_args(["--config", "c.yaml"])
+        assert args.strict_adapters is False
+
+    def test_the_squad_config_is_unchanged(self):
+        """Adding a corpus must not perturb the production SQuAD configuration."""
+        squad = self.load("qgen-squad.yaml")
+        assert squad.name == "qgen-squad"
+        assert squad.dataset.sources == ("squad-qg",)
+        assert squad.dataset.max_context_chars == 4000
+        assert squad.dataset.train_ratio == 0.9
+        assert squad.training.max_steps is None
+
+    def test_both_configs_are_discovered_by_the_directory_guard(self):
+        from qa_ml.paths import find_repo_root
+
+        names = {
+            path.name
+            for path in (find_repo_root() / "ml" / "configs" / "qgen").glob("*.yaml")
+        }
+        assert {"qgen-smoke.yaml", "qgen-squad.yaml", "qgen-learningq.yaml"} <= names
+
+
 class TestPhaseBoundary:
     """What Phase 17C deliberately does not do."""
 

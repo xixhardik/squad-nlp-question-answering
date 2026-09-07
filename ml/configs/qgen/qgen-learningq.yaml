@@ -1,0 +1,97 @@
+name: qgen-learningq
+description: >-
+  LearningQ-only question-generation dataset. Higher-order educational questions
+  from Khan Academy and TED-Ed, which SQuAD cannot supply at any volume: the
+  learningq-qg adapter assigns long_answer / medium / 5 marks rather than the
+  short_answer / easy / 1 mark that a SQuAD span implies.
+phase: "17"
+
+# =============================================================================
+# Running this configuration
+# =============================================================================
+# LearningQ has no Hugging Face mirror. It is distributed by its authors, so a
+# local export is the only route and --source-path is required:
+#
+#   python -m qa_gen_runtime.prepare --config ml/configs/qgen/qgen-learningq.yaml --plan
+#   python -m qa_gen_runtime.prepare --config ml/configs/qgen/qgen-learningq.yaml \
+#     --source-path learningq-qg=data/learningq.jsonl --write-dataset
+#
+# --plan reports the requirement rather than failing on it, so it is safe to run
+# before the export exists.
+#
+# Do NOT pass --strict-adapters with this configuration. The adapter refuses any
+# record with no written answer, and most LearningQ items have none -- an
+# instructor posed the question and never recorded a model answer. Those records
+# are counted and dropped, which is the intended behaviour; --strict-adapters
+# would make the first one fatal and the corpus unreadable. Strict mode is off by
+# default, so this is a warning against turning it on rather than a setting.
+#
+# Expect a large rejection rate in the preparation report. That is a property of
+# the corpus, not a fault, and the per-source ingestion counts state it.
+#
+# Licensing: research use, distributed by the authors rather than the Hub. Terms
+# must be checked before publishing anything derived from it.
+# =============================================================================
+
+dataset:
+  sources: [learningq-qg]
+  seed: 42
+  train_ratio: 0.9
+  validation_ratio: 0.05
+  test_ratio: 0.05
+  # The adapter sets group_key to "doc:<id>", and effective_group_key prefers it,
+  # so "context" already groups by source document here: every question drawn
+  # from one document stays in one split. That is the right unit -- LearningQ
+  # gives many questions per document, and splitting a document would leak.
+  group_by: context
+  min_context_chars: 64
+  # Lower than the 4000 in qgen-squad.yaml, and this is the one dataset value
+  # that had to change. The 1024-token window is shared between the prompt and
+  # the target: roughly 150 tokens of output contract, plus the context, plus a
+  # marks=5 descriptive answer that can run to 300-400 tokens. That leaves about
+  # 500 tokens for the passage, so ~2000 characters of English prose.
+  #
+  # SQuAD never came close to its 4000 -- its paragraphs are ~700 characters and
+  # the measured p95 total was 585 tokens. LearningQ pairs long documents with
+  # long-form answers, and it is the *target* that gets truncated, which removes
+  # the answer the model is supposed to learn. Dropping an over-long context is
+  # the better failure.
+  #
+  # Tune this from the sizing report's truncation rate rather than by guessing;
+  # the audit blocks above 1%.
+  max_context_chars: 2000
+
+# Identical to qgen-squad.yaml from here down: the same base model, the same
+# QLoRA configuration and the same optimisation schedule, so a result from this
+# corpus is comparable with a result from that one. Reports zero deviations from
+# qa_gen.config.VERIFIED_QWEN3_4B_L4.
+model:
+  model_id: Qwen/Qwen3-4B
+  revision: main
+  quantization: 4bit
+  quantization_type: nf4
+  double_quantization: true
+  compute_dtype: bf16
+  max_seq_length: 1024
+  reasoning_mode: disabled
+  chat_template: tokenizer
+  trust_remote_code: false
+
+training:
+  learning_rate: 0.0002
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  precision: auto
+  optimizer: paged_adamw_8bit
+  evaluation_strategy: "no"
+  save_strategy: "no"
+  load_best_model_at_end: false
+  logging_steps: 25
+  gradient_checkpointing: true
+  completion_only_loss: true
+  packing: false
+  seed: 42
