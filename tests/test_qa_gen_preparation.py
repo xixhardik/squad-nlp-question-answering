@@ -129,6 +129,44 @@ def mcq_record(index: int = 0, **overrides: Any) -> dict[str, Any]:
     return {**defaults, **overrides}
 
 
+#: RACE options, in corpus order. Index 2 is correct, so a transform that silently defaulted to
+#: the first option would be caught rather than coincidentally right.
+RACE_OPTIONS = ("Haemoglobin", "Melanin", "Chlorophyll", "Carotene")
+RACE_ANSWER_LABEL = "C"
+RACE_CORRECT_INDEX = 2
+
+
+def race_record(index: int = 0, *, article: str | None = None, **overrides: Any) -> dict[str, Any]:
+    """Build an ``ehovy/race``-shaped record.
+
+    Mirrors the verified upstream schema: the passage is ``article``, the correct option is a
+    label rather than text, ``options`` is a four-string list, and ``example_id`` is the source
+    filename, which repeats across the questions drawn from one article.
+    """
+    defaults = {
+        "example_id": f"high{index // 3}.txt",
+        "article": article if article is not None else f"{PASSAGE} Article {index // 3}.",
+        "question": f"Which pigment absorbs sunlight? (race item {index})",
+        "options": list(RACE_OPTIONS),
+        "answer": RACE_ANSWER_LABEL,
+    }
+    return {**defaults, **overrides}
+
+
+def mixed_corpus(
+    *, squad: int = 60, race: int = 60
+) -> dict[str, list[QuestionGenerationExample]]:
+    """Build a SQuAD + RACE corpus through the real registered adapters.
+
+    Distinct passages per source, so content deduplication has nothing to collapse and the
+    per-source counts mean what they say.
+    """
+    return {
+        "squad-qg": list(adapt_records("squad-qg", [squad_record(i) for i in range(squad)])),
+        "race-mcq": list(adapt_records("race-mcq", [race_record(i) for i in range(race)])),
+    }
+
+
 def target(**overrides: Any) -> QuestionGenerationTarget:
     """Build a valid short-answer target."""
     defaults = {
@@ -2300,6 +2338,318 @@ class TestNoModelWeightsAreLoaded:
             load_sizing_tokenizer(experiment_config())
 
 
+class TestMixedCorpusPreparation:
+    """Preparing SQuAD and RACE together, which is what ``qgen-mixed.yaml`` asks for.
+
+    A mixed corpus can fail in ways a single-corpus one cannot: one source can silently
+    dominate, a question type can vanish, provenance can be lost, and an MCQ answer index can
+    survive adaptation but not the pipeline. Each of those is asserted here rather than assumed
+    from the single-source tests.
+
+    Scale is deliberately small. The mechanisms are scale-free -- the per-source cap buckets on
+    ``example.source`` and samples each bucket independently -- so 60 examples prove the same
+    invariant as 10,000 and the suite stays fast. The real 10,000/10,000 balance is a property of
+    the shipped configuration, pinned separately in :class:`TestShippedQgenConfigs`.
+    """
+
+    def config(self, **overrides: Any) -> QuestionGenerationDatasetConfig:
+        """A dataset configuration shaped like the shipped mixed one."""
+        defaults = {
+            "sources": ("squad-qg", "race-mcq"),
+            "seed": 42,
+            "shuffle_seed": 1234,
+            "train_ratio": 0.9,
+            "validation_ratio": 0.05,
+            "test_ratio": 0.05,
+            "group_by": "context",
+            "min_context_chars": 64,
+            "max_context_chars": 3000,
+            "max_examples_per_source": 20,
+            "max_examples": 40,
+            "drop_duplicates": True,
+        }
+        return QuestionGenerationDatasetConfig(**{**defaults, **overrides})
+
+    def prepare(self, **overrides: Any):
+        """Prepare a mixed corpus with the mixed-shaped configuration."""
+        return prepare_dataset(mixed_corpus(), self.config(**overrides))
+
+    # -- balance ------------------------------------------------------------
+
+    def test_each_source_contributes_exactly_the_per_source_cap(self):
+        """The headline invariant: an equal mix, not a proportional one."""
+        prepared = self.prepare()
+        assert prepared.statistics.examples_by_source == {"race-mcq": 20, "squad-qg": 20}
+
+    def test_the_total_equals_the_sum_of_the_per_source_caps(self):
+        prepared = self.prepare()
+        assert prepared.statistics.total_examples == 40
+        assert prepared.report.kept == 40
+
+    def test_the_total_cap_is_a_no_op_when_it_equals_twice_the_per_source_cap(self):
+        """Why the shipped config sets max_examples to exactly 2x the per-source cap.
+
+        A lower total would re-sample the pooled corpus proportionally and break the balance,
+        so the report must show nothing was dropped at that stage.
+        """
+        prepared = self.prepare()
+        assert prepared.report.total_capped == 0
+        assert prepared.report.stage_counts["capped_per_source"] == 40
+        assert prepared.report.stage_counts["capped_total"] == 40
+
+    def test_a_smaller_total_cap_does_break_the_balance(self):
+        """The failure mode the config's arithmetic avoids, demonstrated rather than asserted.
+
+        Not a recommendation. It documents why max_examples is not set to something tidy like
+        30,000 when the per-source caps sum to 20,000.
+        """
+        prepared = prepare_dataset(mixed_corpus(), self.config(max_examples=30))
+        assert prepared.report.total_capped == 10
+        assert sum(prepared.statistics.examples_by_source.values()) == 30
+        assert prepared.statistics.examples_by_source != {"race-mcq": 15, "squad-qg": 15}
+
+    def test_a_source_with_less_than_the_cap_is_not_topped_up(self):
+        """No upsampling, and no reallocating the shortfall to the other corpus."""
+        corpus = mixed_corpus(squad=60, race=9)
+        prepared = prepare_dataset(corpus, self.config())
+        assert prepared.statistics.examples_by_source == {"race-mcq": 9, "squad-qg": 20}
+
+    # -- provenance ---------------------------------------------------------
+
+    def test_every_example_traces_to_one_of_the_two_corpora(self):
+        prepared = self.prepare()
+        assert {item.source for item in prepared.examples} == {"squad-qg", "race-mcq"}
+
+    def test_provenance_survives_into_every_split(self):
+        """A split missing a source explains a metric of zero for that question type."""
+        breakdown = self.prepare().splits.source_breakdown()
+        assert set(breakdown["train"]) == {"squad-qg", "race-mcq"}
+        assert sum(
+            count for split in breakdown.values() for count in split.values()
+        ) == 40
+
+    def test_the_metadata_names_both_corpora(self):
+        assert self.prepare().metadata.sources == ("race-mcq", "squad-qg")
+
+    # -- question types -----------------------------------------------------
+
+    def test_the_question_type_distribution_is_an_even_split(self):
+        """SQuAD contributes short_answer and RACE contributes mcq, 20 targets each."""
+        prepared = self.prepare()
+        assert prepared.statistics.targets_by_question_type == {"mcq": 20, "short_answer": 20}
+
+    def test_squad_stays_short_answer_and_race_stays_mcq(self):
+        """Neither adapter's question type is coerced by being mixed with the other."""
+        prepared = self.prepare()
+        by_source: dict[str, set[str]] = {}
+        for item in prepared.examples:
+            for entry in item.targets:
+                by_source.setdefault(item.source, set()).add(entry.question_type.value)
+        assert by_source == {"squad-qg": {"short_answer"}, "race-mcq": {"mcq"}}
+
+    def test_only_race_examples_carry_options(self):
+        prepared = self.prepare()
+        for item in prepared.examples:
+            has_options = any(entry.options for entry in item.targets)
+            assert has_options == (item.source == "race-mcq"), item.id
+
+    # -- RACE answer index --------------------------------------------------
+
+    def test_the_race_correct_option_index_is_preserved(self):
+        """The label 'C' must still mean option 2 after the whole pipeline, not option 0."""
+        race = [item for item in self.prepare().examples if item.source == "race-mcq"]
+        assert race
+        for item in race:
+            entry = item.primary_target
+            assert entry.options == RACE_OPTIONS
+            assert entry.correct_option_index == RACE_CORRECT_INDEX
+            assert entry.answer == RACE_OPTIONS[RACE_CORRECT_INDEX]
+
+    def test_the_race_answer_index_survives_the_jsonl_round_trip(self):
+        """The JSONL is what the trainer reads, so the index has to survive serialization."""
+        race = [item for item in self.prepare().examples if item.source == "race-mcq"]
+        restored = [example_from_dict(json.loads(json.dumps(item.as_dict()))) for item in race]
+        assert [item.primary_target.correct_option_index for item in restored] == [
+            RACE_CORRECT_INDEX
+        ] * len(race)
+        assert all(
+            item.primary_target.answer == RACE_OPTIONS[RACE_CORRECT_INDEX] for item in restored
+        )
+
+    def test_the_option_count_distribution_covers_only_the_race_half(self):
+        prepared = self.prepare()
+        assert prepared.statistics.mcq_option_counts.count == 20
+        assert prepared.statistics.mcq_option_counts.minimum == 4
+        assert prepared.statistics.mcq_option_counts.maximum == 4
+
+    # -- leakage ------------------------------------------------------------
+
+    def test_no_leakage_group_spans_two_splits(self):
+        assert self.prepare().splits.leaked_group_keys() == frozenset()
+
+    def test_a_race_article_is_never_split_across_splits(self):
+        """RACE attaches several questions to one article; they must move together."""
+        prepared = self.prepare()
+        placement: dict[str, set[str]] = {}
+        for name in ("train", "validation", "test"):
+            for item in prepared.splits[name]:
+                if item.source == "race-mcq":
+                    placement.setdefault(item.context, set()).add(name)
+        assert placement
+        assert all(len(names) == 1 for names in placement.values()), placement
+
+    def test_the_two_halves_group_at_different_granularities(self):
+        """``group_by: context`` does not mean both halves group by passage.
+
+        ``effective_group_key`` prefers an adapter-set ``group_key``, and the SQuAD adapter
+        sets ``title:<article>`` because paragraphs from one Wikipedia article overlap heavily.
+        RACE sets none, so it falls back to the context fingerprint. The mix therefore has a
+        few large SQuAD groups and many small RACE ones, which is stricter than passage
+        grouping on the SQuAD side and worth stating rather than discovering.
+        """
+        prepared = self.prepare()
+        by_source: dict[str, set[str]] = {}
+        for item in prepared.examples:
+            prefix = item.effective_group_key().split(":", 1)[0]
+            by_source.setdefault(item.source, set()).add(prefix)
+        assert by_source == {"squad-qg": {"title"}, "race-mcq": {"ctx"}}
+
+    def test_group_keys_never_collide_across_the_two_corpora(self):
+        """Distinct prefixes, so a SQuAD article and a RACE passage cannot share a group."""
+        prepared = self.prepare()
+        squad_keys = {
+            item.effective_group_key()
+            for item in prepared.examples
+            if item.source == "squad-qg"
+        }
+        race_keys = {
+            item.effective_group_key()
+            for item in prepared.examples
+            if item.source == "race-mcq"
+        }
+        assert squad_keys and race_keys
+        assert squad_keys.isdisjoint(race_keys)
+
+    def test_every_example_id_is_unique(self):
+        """RACE's repeated example_id must not collapse questions sharing an article."""
+        ids = [item.id for item in self.prepare().examples]
+        assert len(set(ids)) == len(ids) == 40
+
+    # -- determinism --------------------------------------------------------
+
+    def test_preparation_is_deterministic(self):
+        first, second = self.prepare(), self.prepare()
+        assert first.fingerprint == second.fingerprint
+        for name in ("train", "validation", "test"):
+            assert [item.id for item in first.splits[name]] == [
+                item.id for item in second.splits[name]
+            ]
+
+    def test_the_fingerprint_is_independent_of_source_read_order(self):
+        """Same content, corpora supplied in the other order, same dataset."""
+        corpus = mixed_corpus()
+        forward = prepare_dataset(corpus, self.config())
+        reversed_corpus = {key: corpus[key] for key in reversed(list(corpus))}
+        backward = prepare_dataset(reversed_corpus, self.config())
+        assert forward.fingerprint == backward.fingerprint
+        assert forward.statistics.examples_by_source == backward.statistics.examples_by_source
+
+    def test_the_fingerprint_changes_when_the_mix_changes(self):
+        """Otherwise the fingerprint could not distinguish this dataset from a SQuAD-only one."""
+        mixed = self.prepare().fingerprint
+        squad_only = prepare_dataset(
+            {"squad-qg": mixed_corpus()["squad-qg"]},
+            self.config(sources=("squad-qg",)),
+        ).fingerprint
+        assert mixed != squad_only
+
+    def test_the_shuffle_seed_reorders_without_moving_examples(self):
+        """Training order may change; the partition and its fingerprint may not."""
+        first = self.prepare()
+        second = self.prepare(shuffle_seed=99)
+        assert first.fingerprint == second.fingerprint
+        assert {item.id for item in first.splits.train} == {
+            item.id for item in second.splits.train
+        }
+        assert [item.id for item in first.splits.train] != [
+            item.id for item in second.splits.train
+        ]
+
+    def test_the_mix_is_interleaved_rather_than_one_corpus_then_the_other(self):
+        """Ids share a source prefix, so an unshuffled split would teach one corpus at a time."""
+        sequence = [item.source for item in self.prepare().splits.train]
+        transitions = sum(
+            1 for a, b in zip(sequence[:-1], sequence[1:], strict=True) if a != b
+        )
+        assert transitions > 3, f"only {transitions} source changes in {len(sequence)} examples"
+
+    # -- validation is not weakened ----------------------------------------
+
+    def test_nothing_is_rejected_by_the_adapters_or_by_validation(self):
+        """A clean corpus must pass cleanly; a silent drop here would hide a real one."""
+        prepared = self.prepare()
+        assert prepared.report.invalid_dropped == 0
+        assert prepared.report.duplicate_ids_dropped == 0
+        assert prepared.report.duplicate_content_dropped == 0
+        assert prepared.validation.invalid_example_ids == frozenset()
+
+    def test_an_over_long_context_is_still_rejected_in_a_mixed_corpus(self):
+        """The context bound applies to both corpora, not just the one it was tuned for."""
+        corpus = mixed_corpus(squad=60, race=59)
+        corpus["race-mcq"].extend(
+            adapt_records("race-mcq", [race_record(999, article="x" * 5000)])
+        )
+        prepared = prepare_dataset(corpus, self.config(max_examples_per_source=60))
+        assert prepared.report.invalid_dropped == 1
+        assert "x" * 5000 not in {item.context for item in prepared.examples}
+
+    def test_a_short_context_is_still_rejected_in_a_mixed_corpus(self):
+        corpus = mixed_corpus(squad=60, race=59)
+        corpus["race-mcq"].extend(
+            adapt_records("race-mcq", [race_record(998, article="Too short")])
+        )
+        prepared = prepare_dataset(corpus, self.config(max_examples_per_source=60))
+        assert prepared.report.invalid_dropped == 1
+
+    def test_content_deduplication_is_cross_source(self):
+        """One shared passage must collapse before either corpus is capped."""
+        shared = f"{PASSAGE} Shared passage."
+        corpus = mixed_corpus(squad=60, race=60)
+        corpus["race-mcq"].extend(
+            adapt_records("race-mcq", [race_record(0, article=shared)])
+        )
+        corpus["squad-qg"].extend(
+            adapt_records("race-mcq", [race_record(0, article=shared)])
+        )
+        prepared = prepare_dataset(corpus, self.config(max_examples_per_source=61))
+        assert prepared.report.duplicate_ids_dropped == 1
+
+    # -- reporting surface --------------------------------------------------
+
+    def test_the_report_states_every_stage(self):
+        report = self.prepare().report.as_dict()
+        assert list(report["stage_counts"]) == list(PREPARATION_STAGES)
+        assert report["stage_counts"]["adapted"] == 120
+
+    def test_the_report_serializes(self):
+        payload = json.loads(json.dumps(self.prepare().as_dict(), default=str))
+        assert payload["statistics"]["examples_by_source"] == {"race-mcq": 20, "squad-qg": 20}
+        assert payload["statistics"]["targets_by_question_type"] == {
+            "mcq": 20,
+            "short_answer": 20,
+        }
+        assert payload["splits"]["leaked_group_keys"] == []
+
+    def test_only_the_squad_half_is_grounded(self):
+        """SQuAD carries offsets and RACE carries none, so the rate should be about a half."""
+        prepared = self.prepare()
+        assert prepared.statistics.grounded_examples == 20
+        assert prepared.statistics.grounded_rate == 0.5
+        assert all(
+            item.is_grounded == (item.source == "squad-qg") for item in prepared.examples
+        )
+
+
 class TestShippedQgenConfigs:
     """The two production corpus configurations, and how they differ.
 
@@ -2581,6 +2931,147 @@ class TestShippedQgenConfigs:
         assert len(kept) == 4
         assert dropped == ()
 
+    def test_the_mixed_config_loads_and_validates(self):
+        config = self.load("qgen-mixed.yaml")
+        assert config.name == "qgen-mixed"
+        assert config.phase == "17"
+
+    def test_the_mixed_config_names_both_corpora_explicitly(self):
+        """Not left to the "empty means everything" default, which would add lmqg-squad-qag."""
+        assert set(self.load("qgen-mixed.yaml").dataset.sources) == {"squad-qg", "race-mcq"}
+
+    def test_the_mixed_sources_are_registered_adapters(self):
+        from qa_gen import registered_sources
+
+        for source in self.load("qgen-mixed.yaml").dataset.sources:
+            assert source in registered_sources()
+
+    def test_the_mixed_config_asks_for_ten_thousand_from_each_corpus(self):
+        dataset = self.load("qgen-mixed.yaml").dataset
+        assert dataset.max_examples_per_source == 10000
+        assert dataset.max_examples == 20000
+
+    def test_the_total_cap_is_exactly_twice_the_per_source_cap(self):
+        """The arithmetic that keeps the 10,000/10,000 balance exact.
+
+        A total cap below the sum re-samples the pooled corpus proportionally, so this
+        relationship is the whole reason the mix is balanced rather than approximately balanced.
+        """
+        dataset = self.load("qgen-mixed.yaml").dataset
+        assert dataset.max_examples_per_source is not None
+        assert dataset.max_examples == 2 * dataset.max_examples_per_source
+        assert len(dataset.sources) == 2
+
+    def test_the_mixed_config_uses_a_deterministic_seed(self):
+        dataset = self.load("qgen-mixed.yaml").dataset
+        assert dataset.seed == 42
+        assert dataset.shuffle_seed == 1234
+
+    def test_the_mixed_config_controls_leakage_by_context(self):
+        assert self.load("qgen-mixed.yaml").dataset.group_by == "context"
+
+    def test_the_mixed_config_deduplicates_before_capping(self):
+        """Order is fixed in preparation; this pins that the flag enabling it is on."""
+        assert self.load("qgen-mixed.yaml").dataset.drop_duplicates is True
+
+    def test_the_mixed_split_ratios_target_eighteen_thousand_training_examples(self):
+        config = self.load("qgen-mixed.yaml")
+        dataset = config.dataset
+        assert dataset.ratios == (0.9, 0.05, 0.05)
+        assert dataset.max_examples is not None
+        target_train = round(dataset.max_examples * dataset.train_ratio)
+        assert target_train == 18000
+        assert round(dataset.max_examples * dataset.validation_ratio) == 1000
+        assert round(dataset.max_examples * dataset.test_ratio) == 1000
+
+    def test_the_mixed_config_expects_the_documented_step_counts(self):
+        """2,250 steps for one epoch and 4,500 for two, at batch 1 x accumulation 8."""
+        config = self.load("qgen-mixed.yaml")
+        train = round(config.dataset.max_examples * config.dataset.train_ratio)
+        effective = (
+            config.training.per_device_train_batch_size
+            * config.training.gradient_accumulation_steps
+        )
+        assert effective == 8
+        assert estimate_step_count(
+            train, batch_size=1, gradient_accumulation_steps=8, epochs=1
+        ).total_steps == 2250
+        assert estimate_step_count(
+            train, batch_size=1, gradient_accumulation_steps=8, epochs=2
+        ).total_steps == 4500
+
+    def test_the_default_step_plans_cover_both_required_configurations(self):
+        """Both requested plans are reported without passing --step-plan."""
+        assert (1, 8, 1) in DEFAULT_STEP_PLANS
+        assert (1, 8, 2) in DEFAULT_STEP_PLANS
+
+    def test_the_mixed_context_bound_is_the_race_bound(self):
+        """The mix is bounded by RACE's longer passages, not SQuAD's."""
+        mixed = self.load("qgen-mixed.yaml")
+        race = self.load("qgen-race.yaml")
+        squad = self.load("qgen-squad.yaml")
+        assert mixed.dataset.max_context_chars == 3000
+        assert mixed.dataset.max_context_chars == race.dataset.max_context_chars
+        assert mixed.dataset.max_context_chars < squad.dataset.max_context_chars
+        assert mixed.dataset.min_context_chars == 64
+
+    def test_the_mixed_training_stack_is_identical_to_the_squad_config(self):
+        """Only the corpus may differ, so the three results stay comparable."""
+        mixed = self.load("qgen-mixed.yaml")
+        squad = self.load("qgen-squad.yaml")
+        assert mixed.model == squad.model
+        assert mixed.lora == squad.lora
+        assert mixed.training == squad.training
+
+    def test_the_mixed_config_keeps_the_measured_qlora_settings(self):
+        config = self.load("qgen-mixed.yaml")
+        assert config.model.model_id == "Qwen/Qwen3-4B"
+        assert config.model.max_seq_length == 1024
+        assert config.model.quantization == "4bit"
+        assert config.model.quantization_type == "nf4"
+        assert config.model.reasoning_mode == "disabled"
+        assert config.model.chat_template == "tokenizer"
+        assert config.training.completion_only_loss is True
+        assert config.training.gradient_checkpointing is True
+        assert config.training.optimizer == "paged_adamw_8bit"
+
+    def test_the_mixed_config_reports_no_baseline_deviations(self):
+        from qa_gen import VERIFIED_QWEN3_4B_L4
+
+        assert self.load("qgen-mixed.yaml").baseline_deviations(VERIFIED_QWEN3_4B_L4) == ()
+
+    def test_the_mixed_config_is_distinct_from_the_single_corpus_ones(self):
+        mixed = self.load("qgen-mixed.yaml")
+        for name in ("qgen-squad.yaml", "qgen-race.yaml"):
+            other = self.load(name)
+            assert mixed.dataset != other.dataset
+            assert mixed.config_hash() != other.config_hash()
+
+    def test_the_mixed_config_resolves_both_corpora_against_the_hub(self):
+        """Neither half needs --source-path, so a real run needs no extra input."""
+        config = self.load("qgen-mixed.yaml")
+        requests = resolve_requests(config.dataset.sources)
+        by_source = {request.source_id: request for request in requests}
+        assert set(by_source) == {"squad-qg", "race-mcq"}
+        assert by_source["squad-qg"].dataset_id == "rajpurkar/squad"
+        assert by_source["race-mcq"].dataset_id == "ehovy/race"
+        assert by_source["race-mcq"].config_name == "all"
+        assert all(request_is_readable(request) for request in requests)
+
+    def test_the_mixed_config_does_not_require_grounding(self):
+        """Requiring it would discard the entire RACE half, which carries no offsets."""
+        assert self.load("qgen-mixed.yaml").dataset.require_grounding is False
+
+    def test_the_mixed_config_records_the_stricter_licence(self):
+        """RACE's terms govern the mix, and the config is where a reader will look."""
+        from qa_ml.paths import find_repo_root
+
+        text = (
+            find_repo_root() / "ml/configs/qgen/qgen-mixed.yaml"
+        ).read_text(encoding="utf-8").lower()
+        assert "non-commercial" in text
+        assert "may not be published" in text
+
     def test_the_squad_config_is_unchanged(self):
         """Adding a corpus must not perturb the production SQuAD configuration."""
         squad = self.load("qgen-squad.yaml")
@@ -2608,6 +3099,7 @@ class TestShippedQgenConfigs:
             "qgen-squad.yaml",
             "qgen-learningq.yaml",
             "qgen-race.yaml",
+            "qgen-mixed.yaml",
         } <= names
 
 

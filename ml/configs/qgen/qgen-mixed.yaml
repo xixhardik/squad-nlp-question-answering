@@ -1,0 +1,183 @@
+name: qgen-mixed
+description: >-
+  Mixed SQuAD + RACE question-generation dataset: 10,000 short-answer examples
+  from rajpurkar/squad and 10,000 multiple-choice examples from ehovy/race,
+  20,000 in total. Neither corpus can supply both registers -- a SQuAD answer is
+  a literal span, so it yields short_answer targets with no distractors, while
+  every RACE row carries four authored options and a labelled correct one. This
+  is the configuration that trains one model on both question types at the cost
+  of one.
+phase: "17"
+
+# =============================================================================
+# Running this configuration
+# =============================================================================
+#   python -m qa_gen_runtime.prepare --config ml/configs/qgen/qgen-mixed.yaml --plan
+#   python -m qa_gen_runtime.prepare --config ml/configs/qgen/qgen-mixed.yaml \
+#     --allow-download --write-dataset
+#
+# Both corpora are public and ungated, so no token and no --source-path are
+# needed. Both commands are CPU-only: sizing loads the Qwen3-4B *tokenizer* and
+# never the model weights.
+#
+# The report the second command writes answers every question this phase asks --
+# per-source record and rejection counts, duplicate id and content counts, the
+# final SQuAD/RACE balance, split sizes, question-type and source distributions,
+# leakage-group counts, real Qwen3 token statistics, the truncation rate,
+# optimizer-step estimates and the dataset fingerprint. Read it before spending
+# anything on a GPU.
+#
+# -----------------------------------------------------------------------------
+# LICENSING -- the mix is governed by the stricter of the two
+# -----------------------------------------------------------------------------
+# SQuAD is CC BY-SA 4.0. RACE is non-commercial research use only, and its terms
+# forbid redistributing any portion of the passages or of data derived from them.
+# Mixing them means the COMBINED artifact inherits RACE's terms:
+#
+#   * the prepared JSONL, the tokenized cache and any adapter trained on this mix
+#     are derived data and may not be published;
+#   * this dataset cannot back a commercial claim.
+#
+# .gitignore keeps all three out of version control and
+# tests/test_project_structure.py asserts the specific paths. If a publishable
+# artifact is needed later, train it on qgen-squad.yaml instead.
+# =============================================================================
+
+dataset:
+  # Order is irrelevant to the result -- preparation pools sources in sorted
+  # order and every downstream stage is deterministic -- but both are named
+  # explicitly rather than relying on the "empty means everything" default,
+  # which would also pull in lmqg-squad-qag and duplicate SQuAD's content.
+  sources: [squad-qg, race-mcq]
+
+  # One seed drives adapter-independent selection, the per-source cap, the total
+  # cap and the split assignment. Fixed and recorded, so this dataset is
+  # reproducible by fingerprint rather than by description.
+  seed: 42
+  # Separate from `seed` on purpose: this only orders examples within a split, so
+  # changing it reshuffles the training order without moving a single example
+  # between splits and without changing the fingerprint.
+  shuffle_seed: 1234
+
+  # 18,000 train / 1,000 validation / 1,000 test at 20,000 examples.
+  #
+  # These are targets, not guarantees. Leakage control moves WHOLE groups, so the
+  # splitter lands near the ratios rather than exactly on them -- with ~5,200
+  # groups across 20,000 examples the error is a handful of examples per split.
+  # The report's [ SPLITS ] sizes are the actual counts; trust those.
+  train_ratio: 0.9
+  validation_ratio: 0.05
+  test_ratio: 0.05
+
+  # 10,000 from each corpus. Applied AFTER validation and content dedup, so it
+  # yields 10,000 *usable* examples per source rather than 10,000 candidates of
+  # which some fraction was junk.
+  #
+  # The balance is exact rather than approximate: the per-source cap buckets on
+  # example.source and samples each bucket independently, and both corpora have
+  # far more than 10,000 usable examples (SQuAD 87,580 and RACE 86,259 survive
+  # the context bounds below). Verified against the full corpora, not sampled.
+  max_examples_per_source: 10000
+
+  # 20,000 total. This is deliberately EXACTLY 2 x max_examples_per_source, which
+  # makes it a no-op assertion rather than a second sampling stage: the total cap
+  # keeps everything when its input is at or under the limit, so the 10,000 /
+  # 10,000 balance reaches the splitter untouched. Setting it lower would
+  # re-sample the pooled corpus proportionally and silently break the balance.
+  max_examples: 20000
+
+  # Leakage control. Note that this does NOT mean both halves group by passage:
+  # effective_group_key prefers an adapter-set group_key and only falls back to
+  # the context fingerprint. The two halves therefore group at very different
+  # granularities, measured over the rows that survive the bounds below:
+  #
+  #   squad-qg  group_key = "title:<article>"   87,580 rows in    442 groups
+  #                                             mean 198/group, max 817
+  #   race-mcq  group_key unset -> "ctx:<hash>" 86,259 rows in 24,720 groups
+  #                                             mean 3.5/group, max 7
+  #
+  # SQuAD grouping by article rather than paragraph is deliberate upstream:
+  # paragraphs from one Wikipedia article overlap heavily, so splitting an article
+  # leaks even when no paragraph is shared. The prefixes differ, so a SQuAD
+  # article and a RACE passage can never land in the same group.
+  #
+  # The consequence to watch: because the caps below are applied per example and
+  # before the split, the 10,000 SQuAD examples still span all ~442 titles at
+  # roughly 23 examples each, while the 10,000 RACE examples spread thinly over
+  # thousands of small groups. Whole groups move together, so the 5% splits are
+  # assembled from a mixture of a few large SQuAD groups and many small RACE
+  # ones. Check the report's [ SPLITS ] "by source" line: if validation or test
+  # comes out heavily skewed toward one corpus, the per-question-type metrics from
+  # it are not comparable and the split ratios need revisiting.
+  group_by: context
+
+  # Drops the 11 RACE articles that are shorter than a sentence (the shortest is
+  # 9 characters). SQuAD has none this short.
+  min_context_chars: 64
+
+  # 3,000 rather than SQuAD's usual 4,000, because the mix is bounded by RACE's
+  # longer passages. Measured with the real Qwen3-4B tokenizer through the
+  # production record builder: at 4,000 roughly 0.9% of RACE records exceed the
+  # 1,024-token window, and at 3,000 that goes to zero.
+  #
+  # completion_only_loss is on and truncation cuts the tail, so an over-long
+  # record loses the end of its target JSON and the model would be supervised on
+  # malformed output. The cost of the tighter bound is small and asymmetric:
+  #   SQuAD    19 of 87,599 rows dropped (0.022%)
+  #   RACE  1,607 of 87,866 rows dropped (1.829%)
+  # Both leave far more than the 10,000 each source needs.
+  max_context_chars: 3000
+
+  # Cross-source, and that is the point: it collapses any passage the two corpora
+  # happen to share before either is capped, so the 10,000/10,000 balance is
+  # counted over distinct content. Expected to find nothing here -- SQuAD is
+  # Wikipedia and RACE is Chinese English-exam material -- and the report's
+  # duplicate_content count states what it actually found rather than what was
+  # expected.
+  drop_duplicates: true
+
+  # Left off. SQuAD carries character offsets and RACE carries none, so requiring
+  # grounding would discard the entire RACE half and turn this back into a
+  # SQuAD-only run. The report's grounded_rate makes the asymmetry visible: it
+  # should land near 50%.
+  require_grounding: false
+
+# Identical to qgen-squad.yaml and qgen-race.yaml: the same base model, the same
+# QLoRA configuration and the same optimisation schedule, so a result from this
+# mix is comparable with a result from either corpus alone. Reports zero
+# deviations from qa_gen.config.VERIFIED_QWEN3_4B_L4.
+model:
+  model_id: Qwen/Qwen3-4B
+  revision: main
+  quantization: 4bit
+  quantization_type: nf4
+  double_quantization: true
+  compute_dtype: bf16
+  max_seq_length: 1024
+  # Qwen3's template emits an empty <think></think> block in front of the last
+  # assistant turn unless enable_thinking=false is passed. Disabled here so that
+  # flag is emitted as a per-record chat_template_kwargs column and the block
+  # stays out of the supervised completion -- the target is a bare JSON object,
+  # and a model that writes a reasoning block first produces invalid JSON.
+  reasoning_mode: disabled
+  chat_template: tokenizer
+  trust_remote_code: false
+
+training:
+  learning_rate: 0.0002
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  precision: auto
+  optimizer: paged_adamw_8bit
+  evaluation_strategy: "no"
+  save_strategy: "no"
+  load_best_model_at_end: false
+  logging_steps: 25
+  gradient_checkpointing: true
+  completion_only_loss: true
+  packing: false
+  seed: 42
