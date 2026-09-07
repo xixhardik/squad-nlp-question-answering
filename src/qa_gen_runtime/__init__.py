@@ -65,15 +65,23 @@ Modules
 - :mod:`qa_gen_runtime.outputs`      - run directories, already git-ignored
 - :mod:`qa_gen_runtime.config_io`    - YAML and JSON configuration loading
 - :mod:`qa_gen_runtime.sources`      - reading corpora; downloads are opt-in, never implicit
+- :mod:`qa_gen_runtime.prepared`     - the on-disk prepared-dataset format, read and written
 - :mod:`qa_gen_runtime.sizing`       - real-tokenizer length statistics and step estimation
 - :mod:`qa_gen_runtime.train`        - the CLI, which validates by default
 - :mod:`qa_gen_runtime.smoke_data`   - six hand-written examples, downloaded from nowhere
-- :mod:`qa_gen_runtime.smoke`        - the bounded smoke harness; the one ``train()`` call
+- :mod:`qa_gen_runtime.smoke`        - the bounded smoke harness; a guarded ``train()`` call
 - :mod:`qa_gen_runtime.prepare`      - the CLI that prepares and sizes the real dataset
+- :mod:`qa_gen_runtime.benchmark`    - real-data timing on the prepared corpus; guarded too
 
-The three CLI modules are not re-exported below. ``python -m qa_gen_runtime.train``,
-``python -m qa_gen_runtime.smoke`` and ``python -m qa_gen_runtime.prepare`` are how they are
-used, and importing :mod:`qa_gen_runtime` should not pull an argument parser in behind it.
+The four CLI modules are not re-exported below. ``python -m qa_gen_runtime.train``,
+``python -m qa_gen_runtime.smoke``, ``python -m qa_gen_runtime.prepare`` and
+``python -m qa_gen_runtime.benchmark`` are how they are used, and importing
+:mod:`qa_gen_runtime` should not pull an argument parser in behind it.
+
+Two modules call ``trainer.train()``, each from exactly one guarded function reachable only
+through an explicit ``--run``: :mod:`qa_gen_runtime.smoke` over six hand-written examples, and
+:mod:`qa_gen_runtime.benchmark` over a bounded subset of the real prepared corpus. Tests assert
+both the single call site and that no other module has one.
 """
 
 from qa_gen_runtime.chat import (
@@ -138,6 +146,17 @@ from qa_gen_runtime.precision import (
     resolve_dtype,
     resolve_precision,
 )
+from qa_gen_runtime.prepared import (
+    DATASET_DOCUMENT,
+    PreparedDatasetError,
+    PreparedSplitInfo,
+    discover_prepared_datasets,
+    read_prepared_split,
+    resolve_prepared_directory,
+    split_filename,
+    verify_fingerprint,
+    write_prepared_split,
+)
 from qa_gen_runtime.quantization import (
     QuantizationError,
     build_quantization_config,
@@ -181,6 +200,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "CHAT_TEMPLATE_KWARGS_COLUMN",
+    "DATASET_DOCUMENT",
     "DEFAULT_STEP_PLANS",
     "DTYPE_NAMES",
     "OPTIONAL_DEPENDENCIES",
@@ -194,6 +214,8 @@ __all__ = [
     "ModelLoadError",
     "PrecisionError",
     "PrecisionPlan",
+    "PreparedDatasetError",
+    "PreparedSplitInfo",
     "QuantizationError",
     "RecordFormat",
     "RunOutputError",
@@ -232,6 +254,7 @@ __all__ = [
     "describe_chat_handling",
     "describe_device",
     "describe_quantization",
+    "discover_prepared_datasets",
     "estimate_step_count",
     "estimate_tokenization_seconds",
     "is_available",
@@ -245,16 +268,21 @@ __all__ = [
     "measure_record_lengths",
     "memory_report",
     "plan_trainer_arguments",
+    "read_prepared_split",
     "require_peft",
     "require_trl",
     "resolve_dtype",
     "resolve_precision",
+    "resolve_prepared_directory",
     "resolve_record_format",
     "resolve_requests",
     "resolve_run_root",
     "resolve_warmup_steps",
+    "split_filename",
     "summarize_token_lengths",
     "template_supports_reasoning_flag",
     "utc_timestamp",
+    "verify_fingerprint",
+    "write_prepared_split",
     "write_resolved_config",
 ]

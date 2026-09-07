@@ -60,6 +60,7 @@ from qa_gen.splitting import SplitError, SplitName
 from qa_gen_runtime.config_io import ConfigIOError, load_experiment_config
 from qa_gen_runtime.dataset import build_training_records
 from qa_gen_runtime.deps import RuntimeDependencyError
+from qa_gen_runtime.prepared import DATASET_DOCUMENT, write_prepared_split
 from qa_gen_runtime.sizing import (
     DEFAULT_STEP_PLANS,
     DatasetSizing,
@@ -645,23 +646,17 @@ def _write_artifacts(
     if not write_dataset:
         return written
 
+    # Written through qa_gen_runtime.prepared so the reader and the writer of this format are
+    # the same code. A consumer that mis-parses a line drops an example silently, so there is
+    # exactly one implementation of the convention.
     for name in SplitName:
         examples = prepared.splits[name]
         if not examples:
             continue
-        path = directory / f"{name.value}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "".join(
-                json.dumps(example.as_dict(), ensure_ascii=False, default=str) + "\n"
-                for example in examples
-            ),
-            encoding="utf-8",
-        )
-        written[name.value] = path.as_posix()
+        written[name.value] = write_prepared_split(directory, name, examples).as_posix()
 
     written["metadata"] = _write_json(
-        directory / "dataset.json", prepared.metadata.as_dict()
+        directory / DATASET_DOCUMENT, prepared.metadata.as_dict()
     ).as_posix()
     return written
 
