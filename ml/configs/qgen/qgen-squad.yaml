@@ -1,0 +1,46 @@
+name: qgen-squad
+description: >-
+  SQuAD-only question-generation dataset. Excludes lmqg/qag_squad, whose loader
+  is a legacy dataset script the pinned datasets version refuses to execute.
+phase: "17"
+
+dataset:
+  sources: [squad-qg]
+  seed: 42
+  train_ratio: 0.9
+  validation_ratio: 0.05
+  test_ratio: 0.05
+  group_by: context
+  min_context_chars: 64
+  max_context_chars: 4000
+
+model:
+  model_id: Qwen/Qwen3-4B
+  revision: main
+  quantization: 4bit
+  quantization_type: nf4
+  double_quantization: true
+  compute_dtype: bf16
+  max_seq_length: 1024
+  reasoning_mode: disabled
+  chat_template: tokenizer
+  trust_remote_code: false
+
+training:
+  learning_rate: 0.0002
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  precision: auto
+  optimizer: paged_adamw_8bit
+  evaluation_strategy: "no"
+  save_strategy: "no"
+  load_best_model_at_end: false
+  logging_steps: 25
+  gradient_checkpointing: true
+  completion_only_loss: true
+  packing: false
+  seed: 42
