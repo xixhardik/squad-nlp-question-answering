@@ -24,11 +24,18 @@ is how this project is worked on rather than a temporary state. Lazy resolution 
 translation decision is still unit-testable locally, and a missing package fails at the point of
 use with the install command in the message.
 
-Nothing here trains
--------------------
-The trainer *factory* is complete. Calling ``trainer.train()`` is Phase 17B.2, and
-``python -m qa_gen_runtime.train`` refuses to do it -- deliberately, with a message saying so.
-The default command validates a configuration and downloads nothing.
+Exactly one place trains
+------------------------
+``python -m qa_gen_runtime.train`` never trains. Its default command validates a configuration
+and downloads nothing, ``--plan`` adds the translated trainer arguments, and
+``--execute-training`` refuses: full-corpus training is not wired up.
+
+``trainer.train()`` is called from one function in one module,
+:func:`qa_gen_runtime.smoke._call_trainer_train`, reachable only through
+``python -m qa_gen_runtime.smoke --run``. That harness trains a bounded number of steps over
+six hand-written examples to prove the path works; its sibling mode ``--inspect-only`` builds
+the same model, adapters and trainer and stops before the optimiser. A test asserts that no
+other module in this package contains a ``.train()`` or ``.backward()`` call.
 
 Verified API surface
 --------------------
@@ -58,6 +65,12 @@ Modules
 - :mod:`qa_gen_runtime.outputs`      - run directories, already git-ignored
 - :mod:`qa_gen_runtime.config_io`    - YAML and JSON configuration loading
 - :mod:`qa_gen_runtime.train`        - the CLI, which validates by default
+- :mod:`qa_gen_runtime.smoke_data`   - six hand-written examples, downloaded from nowhere
+- :mod:`qa_gen_runtime.smoke`        - the bounded smoke harness; the one ``train()`` call
+
+The two CLI modules are not re-exported below. ``python -m qa_gen_runtime.train`` and
+``python -m qa_gen_runtime.smoke`` are how they are used, and importing
+:mod:`qa_gen_runtime` should not pull an argument parser in behind it.
 """
 
 from qa_gen_runtime.chat import (

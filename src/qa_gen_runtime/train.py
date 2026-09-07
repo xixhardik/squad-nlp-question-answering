@@ -56,8 +56,12 @@ _TRAINING_NOT_WIRED = (
     "Training execution is not wired up in Phase 17B.1.\n"
     "This phase implements and tests the runtime: the model loader, the k-bit preparation and "
     "LoRA attachment, the dataset construction, the trainer factory and the diagnostics. "
-    "Calling trainer.train() is Phase 17B.2, together with a real corpus.\n"
-    "Everything except the training call can be exercised now with --plan."
+    "Calling trainer.train() on a real corpus is a later phase.\n"
+    "Everything except the training call can be exercised now with --plan.\n"
+    "To take a bounded number of real optimiser steps over six hand-written examples, use the "
+    "Phase 17B.2 smoke harness instead:\n"
+    "  python -m qa_gen_runtime.smoke --config <config> --inspect-only\n"
+    "  python -m qa_gen_runtime.smoke --config <config> --run"
 )
 
 
