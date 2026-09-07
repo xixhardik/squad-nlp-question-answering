@@ -41,6 +41,7 @@ from qa_gen import (
     target_from_json,
 )
 from qa_gen_runtime import (
+    CHAT_TEMPLATE_KWARGS_COLUMN,
     DTYPE_NAMES,
     REASONING_TEMPLATE_FLAG,
     ConfigIOError,
@@ -981,39 +982,95 @@ class TestReasoningModeHandling:
         )
         assert applied["effective"].startswith("applied")
 
-    def test_the_training_stage_does_not_claim_the_flag_was_applied(self):
-        """TRL renders the template itself, so nothing here applies the mode during training.
+    def test_the_training_stage_reports_the_flag_as_applied_through_the_column(self):
+        """TRL renders the template, but it reads the mode from the column we emit.
 
-        A record saying "applied" for a training run would be a false statement about what
-        produced the checkpoint, which is the one thing a run record must not do.
+        This assertion was the other way round until a Phase 17B.2 inspection on the Studio
+        showed the flag does change trained tokens: Qwen3 puts an empty <think></think> block
+        in front of the last assistant turn unconditionally, so without the column that block
+        lands inside the supervised completion.
         """
         record = describe_chat_handling(
             config().model, SimpleNamespace(chat_template="{{ enable_thinking }}")
         )
         assert record["stage"] == "training"
         assert record["applied_by"] == "trl.SFTTrainer"
-        assert record["effective"].startswith("not applied")
+        assert record["effective"].startswith("applied")
+        assert record["template_kwargs"] == {REASONING_TEMPLATE_FLAG: False}
 
-    def test_the_training_description_explains_why_no_trained_token_changes(self):
+    def test_the_training_description_names_the_mechanism_and_the_effect(self):
         record = describe_chat_handling(
             config().model, SimpleNamespace(chat_template="{{ enable_thinking }}")
         )
-        assert "generation prompt" in record["effective"]
+        assert "chat_template_kwargs" in record["effective"]
+        assert "<think></think>" in record["effective"]
+
+    def test_a_template_without_the_flag_is_reported_as_inert_at_either_stage(self):
+        for stage in ("training", "inference"):
+            record = describe_chat_handling(
+                config().model,
+                SimpleNamespace(chat_template="{{ messages }}"),
+                stage=stage,
+            )
+            assert record["effective"].startswith("inert"), stage
+            assert record["template_kwargs"] == {}
 
     def test_the_description_works_before_a_tokenizer_exists(self):
-        record = describe_chat_handling(config().model, None, stage="inference")
-        assert record["reasoning_mode"] == "disabled"
-        assert record["effective"] is None
+        for stage in ("training", "inference"):
+            record = describe_chat_handling(config().model, None, stage=stage)
+            assert record["reasoning_mode"] == "disabled"
+            assert record["effective"] is None, stage
 
-    def test_the_records_carry_no_chat_template_kwargs_column(self):
-        """The column TRL would read is deliberately not emitted; see qa_gen_runtime.chat.
+    def test_no_chat_template_kwargs_column_without_a_tokenizer(self):
+        """Whether the template understands the flag is settled by reading the template.
 
-        Pinned so that adding it becomes a deliberate act. Setting it would change the
-        prompt-only rendering that the completion mask is measured against, and whether TRL
-        guards the resulting prefix mismatch in the SFT tokenize path is unverified.
+        A caller with no tokenizer cannot know, so nothing is emitted rather than guessed.
         """
         record = build_training_records([example()], config())[0]
-        assert "chat_template_kwargs" not in record
+        assert CHAT_TEMPLATE_KWARGS_COLUMN not in record
+
+    def test_the_column_is_emitted_when_the_template_understands_the_flag(self):
+        tokenizer = SimpleNamespace(chat_template="{{ enable_thinking }}")
+        record = build_training_records([example()], config(), tokenizer=tokenizer)[0]
+        assert record[CHAT_TEMPLATE_KWARGS_COLUMN] == {REASONING_TEMPLATE_FLAG: False}
+
+    def test_the_column_is_absent_when_the_template_ignores_the_flag(self):
+        """Passing an unknown keyword is at best ignored and at worst a Jinja error."""
+        tokenizer = SimpleNamespace(chat_template="{{ messages }}")
+        record = build_training_records([example()], config(), tokenizer=tokenizer)[0]
+        assert CHAT_TEMPLATE_KWARGS_COLUMN not in record
+
+    def test_the_column_is_absent_under_inherit(self):
+        tokenizer = SimpleNamespace(chat_template="{{ enable_thinking }}")
+        cfg = config(model={"reasoning_mode": "inherit"})
+        record = build_training_records([example()], cfg, tokenizer=tokenizer)[0]
+        assert CHAT_TEMPLATE_KWARGS_COLUMN not in record
+
+    def test_the_column_carries_true_when_reasoning_is_enabled(self):
+        tokenizer = SimpleNamespace(chat_template="{{ enable_thinking }}")
+        cfg = config(model={"reasoning_mode": "enabled"})
+        record = build_training_records([example()], cfg, tokenizer=tokenizer)[0]
+        assert record[CHAT_TEMPLATE_KWARGS_COLUMN] == {REASONING_TEMPLATE_FLAG: True}
+
+    def test_the_column_is_only_emitted_for_the_conversational_shape(self):
+        """TRL reads it inside the branch that applies a chat template; the others never do."""
+        tokenizer = SimpleNamespace(chat_template="{{ enable_thinking }}")
+
+        # Packing forces language modeling. The mode is still 'disabled' here, so the shape is
+        # the only thing suppressing the column.
+        packed = config(training={"packing": True, "completion_only_loss": False})
+        record = build_training_records([example()], packed, tokenizer=tokenizer)[0]
+        assert set(record) == {"text", "example_id"}
+
+        # Phase 17A already refuses 'plain' together with an explicit reasoning mode, so the
+        # prompt-completion shape can only ever be reached under 'inherit'.
+        from qa_gen import GenerationConfigError
+
+        plain = config(model={"chat_template": "plain", "reasoning_mode": "inherit"})
+        record = build_training_records([example()], plain, tokenizer=tokenizer)[0]
+        assert CHAT_TEMPLATE_KWARGS_COLUMN not in record
+        with pytest.raises(GenerationConfigError, match="reasoning mode is a chat-template"):
+            config(model={"chat_template": "plain"})
 
 
 class TestTrainerArgumentTranslation:

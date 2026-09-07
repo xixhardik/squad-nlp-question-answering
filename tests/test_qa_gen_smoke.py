@@ -1,4 +1,4 @@
-"""Tests for the Phase 17B.2 smoke harness.
+r"""Tests for the Phase 17B.2 smoke harness.
 
 What these tests can and cannot prove
 -------------------------------------
@@ -22,11 +22,20 @@ any of them.
 
 The trainer stub is a mimic, not a mock
 ---------------------------------------
-:class:`_TokenTable` and :func:`_tokenize_record` reimplement TRL's arithmetic from the v0.29.1
-sources -- ``completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) -
-len(prompt_ids))`` over an ``add_generation_prompt=True`` prompt rendering. That makes the
-inspection tests meaningful against a realistic record shape while staying honest about the
-fact that the real tokenizer is the thing that has to agree.
+:func:`_render_qwen3` reimplements the two branches of the real Qwen3-4B chat template that
+matter here, read from ``Qwen/Qwen3-4B``'s ``tokenizer_config.json``: the assistant turn, which
+emits ``<think>\n\n</think>\n\n`` in front of the content unconditionally, and the
+generation prompt, which emits the same block only when ``enable_thinking`` is explicitly
+false. :func:`_tokenize_record` then applies TRL v0.29.1's own arithmetic --
+``completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) -
+len(prompt_ids))`` -- over a prefix-stable atom segmentation, so ``prompt_ids`` is a token-exact
+prefix of ``prompt_completion_ids`` exactly when the prompt string is a string prefix of the
+full rendering, which is the real invariant.
+
+An earlier version of this mimic chunked the rendering per message and emitted no think block.
+It agreed with the harness and disagreed with the Studio, which is the specific way a stub can
+be worse than no test at all. :class:`TestQwen3ThinkingBlock` reproduces the failure the
+Studio actually reported and pins the fix.
 """
 
 from __future__ import annotations
@@ -34,6 +43,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,8 +54,13 @@ from qa_gen import TARGET_JSON_FIELDS, experiment_config_from_dict, target_from_
 from qa_gen.validation import validate_dataset
 from qa_gen_runtime import smoke as smoke_module
 from qa_gen_runtime import smoke_data as smoke_data_module
+from qa_gen_runtime.chat import REASONING_TEMPLATE_FLAG
 from qa_gen_runtime.config_io import load_experiment_config
-from qa_gen_runtime.dataset import build_training_records, resolve_record_format
+from qa_gen_runtime.dataset import (
+    CHAT_TEMPLATE_KWARGS_COLUMN,
+    build_training_records,
+    resolve_record_format,
+)
 from qa_gen_runtime.loader import LoadedModel
 from qa_gen_runtime.outputs import RunPaths
 from qa_gen_runtime.precision import resolve_precision
@@ -135,23 +150,69 @@ class FakeTokenizer:
         return self._table.decode(ids)
 
 
+#: The empty reasoning block Qwen3's template emits. From the assistant branch,
+#: ``'<think>\n' + ''.strip('\n') + '\n</think>\n\n'``, and from the generation-prompt branch
+#: as the literal ``'<think>\n\n</think>\n\n'``. Byte-identical, which is what keeps the prefix
+#: exact when the flag is set.
+EMPTY_THINK_BLOCK = "<think>\n\n</think>\n\n"
+
+#: A prefix-stable segmentation: special tokens, think delimiters, whitespace runs, words, then
+#: any single character. Atomising a string prefix yields a prefix of the atoms, so the mimic
+#: reproduces the real token-prefix property rather than approximating it.
+_ATOM = re.compile(r"<\|[^|>]*\|>|</?think>|\s+|\w+|.")
+
+
+def _render_qwen3(
+    messages: list[dict[str, str]], *, add_generation_prompt: bool, enable_thinking: Any = None
+) -> str:
+    """Render messages the way Qwen3-4B's chat template does.
+
+    Only the branches this project reaches are modelled: no tools, no tool calls, no
+    ``reasoning_content``, and exactly one assistant turn which is last. Under those conditions
+    ``loop.index0 > ns.last_query_index`` and ``loop.last`` both hold, so the assistant branch
+    takes the think-block path unconditionally.
+    """
+    assert [m["role"] for m in messages].count("assistant") <= 1
+    parts: list[str] = []
+    for message in messages:
+        role, content = message["role"], message["content"]
+        if role == "assistant":
+            parts.append(
+                f"<|im_start|>assistant\n{EMPTY_THINK_BLOCK}{content}<|im_end|>\n"
+            )
+        else:
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+    if add_generation_prompt:
+        parts.append("<|im_start|>assistant\n")
+        # The one place enable_thinking is consulted, and only when explicitly false.
+        if enable_thinking is False:
+            parts.append(EMPTY_THINK_BLOCK)
+    return "".join(parts)
+
+
 def _tokenize_record(record: dict[str, Any], table: _TokenTable) -> dict[str, Any]:
     """Turn a conversational record into a tokenized row the way TRL v0.29.1 does.
 
-    One token per rendered chunk, which is coarse but preserves the property under test: the
-    prompt rendering ends with the assistant-turn opener, the completion follows it, and the
-    mask is zeros for the prompt length then ones for the remainder.
+    Reproduces the two ``apply_chat_template`` calls in ``SFTTrainer._prepare_dataset``, both
+    of which receive ``**example.get("chat_template_kwargs", {})``, and then TRL's mask
+    arithmetic verbatim.
     """
-    prompt_pieces = [
-        f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
-        for message in record["prompt"]
-    ]
-    prompt_pieces.append("<|im_start|>assistant\n")
-    completion_pieces = [record["completion"][0]["content"], "<|im_end|>\n"]
-    ids = [table.add(piece) for piece in prompt_pieces + completion_pieces]
+    template_kwargs = record.get(CHAT_TEMPLATE_KWARGS_COLUMN) or {}
+    prompt_text = _render_qwen3(
+        list(record["prompt"]),
+        add_generation_prompt=True,
+        enable_thinking=template_kwargs.get("enable_thinking"),
+    )
+    full_text = _render_qwen3(
+        list(record["prompt"]) + list(record["completion"]),
+        add_generation_prompt=False,
+        enable_thinking=template_kwargs.get("enable_thinking"),
+    )
+    prompt_ids = [table.add(atom) for atom in _ATOM.findall(prompt_text)]
+    full_ids = [table.add(atom) for atom in _ATOM.findall(full_text)]
     return {
-        "input_ids": ids,
-        "completion_mask": [0] * len(prompt_pieces) + [1] * len(completion_pieces),
+        "input_ids": full_ids,
+        "completion_mask": [0] * len(prompt_ids) + [1] * (len(full_ids) - len(prompt_ids)),
         "example_id": record.get("example_id"),
     }
 
@@ -812,13 +873,23 @@ class TestRunMode:
 # ---------------------------------------------------------------------------
 
 
-def _built_record() -> tuple[dict[str, Any], FakeTokenizer, Any]:
-    """Return a tokenized first record, its tokenizer and the target it came from."""
+def _built_record(*, with_reasoning_flag: bool = True) -> tuple[dict[str, Any], Any, Any]:
+    """Return a tokenized first record, its tokenizer and the example it came from.
+
+    ``with_reasoning_flag=False`` withholds the tokenizer from
+    :func:`build_training_records`, so no ``chat_template_kwargs`` column is emitted and the
+    record is the pre-fix one the Studio inspection reported.
+    """
     table = _TokenTable()
+    tokenizer = FakeTokenizer(table)
     examples = build_smoke_examples()
-    records = build_training_records(examples, bounded_config())
+    records = build_training_records(
+        examples,
+        bounded_config(),
+        tokenizer=tokenizer if with_reasoning_flag else None,
+    )
     row = _tokenize_record(records[0], table)
-    return row, FakeTokenizer(table), examples[0]
+    return row, tokenizer, examples[0]
 
 
 class TestRecordInspection:
@@ -855,7 +926,11 @@ class TestRecordInspection:
         )
         assert example.context[:48] in inspection.decoded_prompt
         assert example.context[:48] not in inspection.decoded_completion
-        assert inspection.decoded_prompt.endswith("<|im_start|>assistant\n")
+        # With the flag set, the prompt absorbs the empty think block, so the boundary sits
+        # after it rather than after the assistant-turn opener.
+        assert inspection.decoded_prompt.endswith(
+            f"<|im_start|>assistant\n{EMPTY_THINK_BLOCK}"
+        )
 
     def test_the_completion_parses_back_through_the_canonical_parser(self):
         row, tokenizer, example = _built_record()
@@ -877,14 +952,33 @@ class TestRecordInspection:
         assert inspection.ok is False
 
     def test_a_mask_that_starts_too_early_is_caught(self):
-        """The other direction: prompt tokens would be trained on."""
+        r"""The other direction: prompt tokens would be trained on.
+
+        The prompt's last atom is the ``\n\n`` closing the think block, so this is caught by
+        the leading-whitespace check rather than the prefix check -- which is why the two are
+        separate assertions in the harness.
+        """
         row, tokenizer, example = _built_record()
         shifted = list(row["completion_mask"])
         first = shifted.index(1)
         shifted[first - 1] = 1
         row = {**row, "completion_mask": shifted}
         inspection = self.inspect(row, tokenizer, example)
+        assert inspection.checks["completion_begins_without_leading_whitespace"] is False
+        assert inspection.decoded_completion.startswith("\n")
+        assert inspection.ok is False
+
+    def test_a_mask_that_swallows_the_whole_think_block_is_caught(self):
+        """Shifted far enough that the prefix check fires too."""
+        row, tokenizer, example = _built_record()
+        shifted = list(row["completion_mask"])
+        first = shifted.index(1)
+        for index in range(max(0, first - 4), first):
+            shifted[index] = 1
+        row = {**row, "completion_mask": shifted}
+        inspection = self.inspect(row, tokenizer, example)
         assert inspection.checks["completion_starts_with_expected_json_prefix"] is False
+        assert "</think>" in inspection.decoded_completion
         assert inspection.ok is False
 
     def test_a_mask_covering_the_whole_sequence_is_caught(self):
@@ -934,24 +1028,14 @@ class TestRecordInspection:
         inspection = self.inspect(row, tokenizer, example, max_length=len(row["input_ids"]))
         assert inspection.checks["sequence_within_max_length"] is False
 
-    def test_thinking_markers_are_counted_and_the_record_is_left_alone(self):
-        """A marker in the prompt half is exactly the case that offsets the mask."""
-        table = _TokenTable()
-        examples = build_smoke_examples()
-        records = build_training_records(examples, bounded_config())
-        row = _tokenize_record(records[0], table)
-        think = table.add("<think>\n\n</think>\n\n")
-        boundary = row["completion_mask"].index(1)
-        row = {
-            **row,
-            "input_ids": [*row["input_ids"][:boundary], think, *row["input_ids"][boundary:]],
-            "completion_mask": [
-                *row["completion_mask"][:boundary],
-                0,
-                *row["completion_mask"][boundary:],
-            ],
-        }
-        inspection = self.inspect(row, FakeTokenizer(table), examples[0])
+    def test_the_markers_are_counted_and_the_record_is_never_altered(self):
+        """Qwen3 puts the block in the prompt once the flag is set; it is reported, not removed.
+
+        The failure direction -- the block inside the completion -- is covered by
+        :class:`TestQwen3ThinkingBlock`, which reproduces it from the real template branches.
+        """
+        row, tokenizer, example = _built_record()
+        inspection = self.inspect(row, tokenizer, example)
         markers = inspection.thinking_markers
         assert markers["present_in_sequence"] is True
         assert markers["present_in_prompt"] is True
@@ -960,13 +1044,27 @@ class TestRecordInspection:
         assert markers["counts"]["</think>"] == 1
         assert markers["record_modified_to_remove_them"] is False
         assert "<think>" in inspection.decoded_sequence
+        assert "<think>" not in inspection.decoded_completion
 
-    def test_no_thinking_marker_is_reported_when_there_is_none(self):
-        row, tokenizer, example = _built_record()
-        inspection = self.inspect(row, tokenizer, example)
+    def test_no_marker_is_reported_for_a_template_that_emits_none(self):
+        """The counting itself reports zero rather than defaulting to a finding."""
+        table = _TokenTable()
+        example = build_smoke_examples()[0]
+        target_json = example.primary_target.to_json()
+        prompt_atoms = _ATOM.findall(f"<|im_start|>user\n{example.context}<|im_end|>\n")
+        completion_atoms = _ATOM.findall(f"{target_json}<|im_end|>\n")
+        prompt_ids = [table.add(atom) for atom in prompt_atoms]
+        completion_ids = [table.add(atom) for atom in completion_atoms]
+        row = {
+            "input_ids": prompt_ids + completion_ids,
+            "completion_mask": [0] * len(prompt_ids) + [1] * len(completion_ids),
+            "example_id": example.id,
+        }
+        inspection = self.inspect(row, FakeTokenizer(table), example)
         markers = inspection.thinking_markers
         assert markers["present_in_sequence"] is False
         assert markers["counts"] == dict.fromkeys(THINKING_MARKERS, 0)
+        assert inspection.ok, inspection.failed_checks + inspection.undetermined_checks
 
     def test_the_first_record_is_read_from_the_trainer_not_rebuilt(self):
         row, _, _ = _built_record()
@@ -980,6 +1078,138 @@ class TestRecordInspection:
     def test_an_empty_dataset_raises(self):
         with pytest.raises(SmokeHarnessError, match="first record"):
             first_tokenized_record(FakeTrainer([]))
+
+
+class TestQwen3ThinkingBlock:
+    r"""The defect a Studio inspect-only run found, and the mechanism that fixes it.
+
+    The reported symptom was a decoded completion of
+    ``<think>\n\n</think>\n\n{"question_type": ...}`` with
+    ``completion_starts_with_expected_json_prefix`` as the single failed invariant. Nothing
+    about the mask arithmetic was wrong; the boundary was in the wrong place, because Qwen3's
+    assistant branch emits the block whatever ``enable_thinking`` says while the
+    generation-prompt branch emits it only when the flag is explicitly false.
+    """
+
+    def inspect(self, row, tokenizer, example):
+        """Run the inspection with the harness's own arguments."""
+        return inspect_tokenized_record(
+            row,
+            tokenizer,
+            max_length=4096,
+            context_probe=example.context[:48],
+            source_target=example.primary_target,
+        )
+
+    def test_the_template_mimic_matches_the_published_qwen3_branches(self):
+        """Both branches produce the same block, byte for byte. That is what aligns them."""
+        messages = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "C"}]
+        full = _render_qwen3(messages, add_generation_prompt=False)
+        assert full.endswith(f"<|im_start|>assistant\n{EMPTY_THINK_BLOCK}C<|im_end|>\n")
+
+        without = _render_qwen3(messages[:1], add_generation_prompt=True)
+        assert without.endswith("<|im_start|>assistant\n")
+        assert EMPTY_THINK_BLOCK not in without
+
+        with_flag = _render_qwen3(
+            messages[:1], add_generation_prompt=True, enable_thinking=False
+        )
+        assert with_flag.endswith(f"<|im_start|>assistant\n{EMPTY_THINK_BLOCK}")
+
+        # The fixed prompt is a byte-exact prefix of the full rendering; the unfixed one is too,
+        # just a shorter one. Neither offsets the mask; they disagree about where it starts.
+        assert full.startswith(with_flag)
+        assert full.startswith(without)
+        assert len(with_flag) > len(without)
+
+    def test_without_the_flag_the_think_block_lands_in_the_completion(self):
+        """The exact failure the Studio reported, reproduced."""
+        row, tokenizer, example = _built_record(with_reasoning_flag=False)
+        inspection = self.inspect(row, tokenizer, example)
+        assert inspection.decoded_completion.startswith(EMPTY_THINK_BLOCK)
+        assert inspection.thinking_markers["present_in_completion"] is True
+        assert inspection.thinking_markers["present_in_prompt"] is False
+        assert inspection.checks["completion_starts_with_expected_json_prefix"] is False
+        assert inspection.ok is False
+
+    def test_without_the_flag_the_mask_is_still_aligned(self):
+        """Distinguishes the two failure modes: the boundary moved, the arithmetic did not."""
+        row, tokenizer, example = _built_record(with_reasoning_flag=False)
+        inspection = self.inspect(row, tokenizer, example)
+        assert inspection.checks["mask_length_matches_input_ids"] is True
+        assert inspection.checks["mask_region_is_contiguous"] is True
+        assert inspection.checks["mask_excludes_the_first_token"] is True
+        assert inspection.checks["mask_reaches_the_final_token"] is True
+        assert inspection.failed_checks == ("completion_starts_with_expected_json_prefix",)
+
+    def test_with_the_flag_the_completion_begins_at_the_json(self):
+        """The requirement: no <think> block, and the JSON starts immediately."""
+        row, tokenizer, example = _built_record(with_reasoning_flag=True)
+        inspection = self.inspect(row, tokenizer, example)
+        assert inspection.decoded_completion.startswith('{"question_type":')
+        assert not inspection.decoded_completion.startswith(EMPTY_THINK_BLOCK)
+        assert "<think>" not in inspection.decoded_completion
+        assert "</think>" not in inspection.decoded_completion
+        assert inspection.checks["completion_starts_with_expected_json_prefix"] is True
+        assert inspection.checks["completion_begins_without_leading_whitespace"] is True
+        assert inspection.ok, inspection.failed_checks + inspection.undetermined_checks
+
+    def test_with_the_flag_the_block_moves_into_the_masked_prompt(self):
+        """It is not deleted, it is excluded from the loss. Reported, not hidden."""
+        row, tokenizer, example = _built_record(with_reasoning_flag=True)
+        inspection = self.inspect(row, tokenizer, example)
+        assert inspection.thinking_markers["present_in_sequence"] is True
+        assert inspection.thinking_markers["present_in_prompt"] is True
+        assert inspection.thinking_markers["present_in_completion"] is False
+        assert inspection.thinking_markers["record_modified_to_remove_them"] is False
+        assert EMPTY_THINK_BLOCK in inspection.decoded_prompt
+
+    def test_the_flag_shifts_the_boundary_by_exactly_the_block(self):
+        """Before and after, side by side, on the same corpus."""
+        before_row, before_tok, example = _built_record(with_reasoning_flag=False)
+        after_row, after_tok, _ = _built_record(with_reasoning_flag=True)
+        before = self.inspect(before_row, before_tok, example)
+        after = self.inspect(after_row, after_tok, example)
+
+        assert before.input_ids_length == after.input_ids_length
+        assert after.prompt_token_count > before.prompt_token_count
+        assert after.completion_token_count < before.completion_token_count
+        moved = after.prompt_token_count - before.prompt_token_count
+        assert moved == len(_ATOM.findall(EMPTY_THINK_BLOCK))
+        # The trained sequence is identical; only the loss boundary differs.
+        assert before.decoded_sequence == after.decoded_sequence
+
+    def test_the_target_json_still_round_trips_after_the_fix(self):
+        row, tokenizer, example = _built_record(with_reasoning_flag=True)
+        inspection = self.inspect(row, tokenizer, example)
+        assert inspection.parse_error is None
+        assert inspection.extracted_json == example.primary_target.to_json()
+        assert target_from_json(inspection.extracted_json) == example.primary_target
+
+    def test_the_column_is_what_the_records_carry(self):
+        table = _TokenTable()
+        tokenizer = FakeTokenizer(table)
+        records = build_training_records(
+            build_smoke_examples(), bounded_config(), tokenizer=tokenizer
+        )
+        for record in records:
+            assert record[CHAT_TEMPLATE_KWARGS_COLUMN] == {REASONING_TEMPLATE_FLAG: False}
+
+    def test_every_example_in_the_corpus_is_fixed_not_just_the_first(self):
+        table = _TokenTable()
+        tokenizer = FakeTokenizer(table)
+        examples = build_smoke_examples()
+        records = build_training_records(examples, bounded_config(), tokenizer=tokenizer)
+        for record, example in zip(records, examples, strict=True):
+            inspection = inspect_tokenized_record(
+                _tokenize_record(record, table),
+                tokenizer,
+                max_length=4096,
+                context_probe=example.context[:48],
+                source_target=example.primary_target,
+            )
+            assert inspection.ok, (example.id, inspection.failed_checks)
+            assert inspection.decoded_completion.startswith('{"question_type":')
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Turning Phase 17A examples into the records TRL trains on.
+r"""Turning Phase 17A examples into the records TRL trains on.
 
 One prompt format, reused
 -------------------------
@@ -39,11 +39,43 @@ The ``conversational`` shape hands TRL a list of ``{"role", "content"}`` mapping
 tokenizer's own chat template render them. No ``<|im_start|>`` is written here or in
 :mod:`qa_gen.prompts`; a chat template belongs to a tokenizer revision, and Qwen has changed
 its own between releases.
+
+One exception: the reasoning flag has to be in the record
+---------------------------------------------------------
+A ``chat_template_kwargs`` column is emitted for conversational records when the configuration
+asks for an explicit reasoning mode and the tokenizer's template understands the flag. It is
+the only per-record field here that is not prompt content, and it is not decoration -- without
+it, supervision on Qwen3 is wrong. Measured on the Studio rather than reasoned about:
+
+Qwen3's template renders the **last** assistant turn as
+``<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}``, unconditionally,
+whether or not ``enable_thinking`` was passed. With no reasoning content that is an empty
+``<think>\n\n</think>\n\n`` block sitting in front of the target JSON. The
+``add_generation_prompt`` branch, meanwhile, emits that block only when ``enable_thinking`` is
+explicitly ``false``.
+
+TRL builds the loss mask from the difference between the two renderings, so the mismatch lands
+squarely on the supervision:
+
+- **Flag absent.** Prompt ends at ``<|im_start|>assistant\n``; the completion therefore begins
+  with the empty think block, and the model is trained to emit one before every answer.
+- **Flag false.** Both renderings contain the block, in the same place, byte for byte. The
+  prompt absorbs it and the completion begins at ``{"question_type":``.
+
+The flag reaches ``apply_chat_template`` for the prompt-only *and* the prompt-plus-completion
+rendering -- TRL v0.29.1 passes ``**example.get("chat_template_kwargs", {})`` to both -- which
+is what keeps the prompt a byte-exact prefix and the mask aligned. Passing it to only one would
+be the offset-mask bug it prevents.
+
+A tokenizer is therefore required to emit the column, because whether the template understands
+the flag is decided by reading the template. :func:`build_training_records` takes one as an
+optional argument and emits nothing without it, which keeps every existing caller and every
+test that has no tokenizer working unchanged.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -51,9 +83,11 @@ from typing import Any
 from qa_gen.config import GenerationExperimentConfig
 from qa_gen.examples import QuestionGenerationExample
 from qa_gen.prompts import PromptTemplate, RenderedPrompt
+from qa_gen_runtime.chat import chat_template_kwargs as resolve_chat_template_kwargs
 from qa_gen_runtime.deps import require_datasets
 
 __all__ = [
+    "CHAT_TEMPLATE_KWARGS_COLUMN",
     "DatasetBuildError",
     "RecordFormat",
     "TrainingRecordBuilder",
@@ -61,6 +95,11 @@ __all__ = [
     "build_training_records",
     "resolve_record_format",
 ]
+
+#: The column TRL v0.29.1 reads extra chat-template arguments from. Named here because it is a
+#: TRL convention rather than something this project chose, and because two modules and a test
+#: refer to it.
+CHAT_TEMPLATE_KWARGS_COLUMN = "chat_template_kwargs"
 
 
 class DatasetBuildError(ValueError):
@@ -124,12 +163,17 @@ class TrainingRecordBuilder:
         include_example_id: Carry the example id on each record. Useful for tracing a
             generation back to its source; TRL ignores extra columns when
             ``remove_unused_columns`` is left at its default.
+        chat_template_kwargs: Extra arguments for the tokenizer's chat template, emitted as a
+            per-record column for the conversational shape only. ``None`` or empty emits
+            nothing. See this module's docstring for why Qwen3 needs
+            ``{"enable_thinking": False}`` here and what goes wrong without it.
     """
 
     template: PromptTemplate
     record_format: RecordFormat = RecordFormat.CONVERSATIONAL
     compact_target: bool = True
     include_example_id: bool = True
+    chat_template_kwargs: Mapping[str, Any] | None = None
 
     def render(self, example: QuestionGenerationExample) -> RenderedPrompt:
         """Render one example through the Phase 17A prompt layer.
@@ -178,10 +222,16 @@ class TrainingRecordBuilder:
             # mappings only. Splitting at the assistant turn is what gives TRL a prompt and a
             # completion it can mask between.
             messages = rendered.as_messages(include_completion=True)
-            return {
+            record: dict[str, Any] = {
                 "prompt": [dict(message) for message in messages[:-1]],
                 "completion": [dict(messages[-1])],
             }
+            if self.chat_template_kwargs:
+                # Conversational only: TRL reads this column inside the branch that applies a
+                # chat template, and the other two shapes never reach it. Emitting it there
+                # would be inert and would imply the reasoning mode had been honoured.
+                record[CHAT_TEMPLATE_KWARGS_COLUMN] = dict(self.chat_template_kwargs)
+            return record
 
         if self.record_format is RecordFormat.PROMPT_COMPLETION:
             prompt = rendered.as_text() if not rendered.completion else _prompt_text(rendered)
@@ -205,6 +255,7 @@ def build_training_records(
     config: GenerationExperimentConfig,
     *,
     record_format: RecordFormat | None = None,
+    tokenizer: Any = None,
 ) -> list[dict[str, Any]]:
     """Render a corpus into plain training records.
 
@@ -218,6 +269,11 @@ def build_training_records(
         config: The experiment configuration, which supplies the template and the shape.
         record_format: Override the shape implied by the configuration. For tests and for a
             caller deliberately comparing formats.
+        tokenizer: The tokenizer that will render the chat template. Required to emit the
+            ``chat_template_kwargs`` column, because whether the template understands the
+            reasoning flag is settled by reading the template rather than by the model name.
+            Omitting it emits no column, which is the right answer for a caller that has no
+            tokenizer -- but a *training* run should pass one. See the module docstring.
 
     Returns:
         One record per example, in input order.
@@ -225,9 +281,15 @@ def build_training_records(
     Raises:
         DatasetBuildError: If any example cannot be rendered.
     """
+    resolved_format = record_format or resolve_record_format(config)
+    template_kwargs: dict[str, Any] | None = None
+    if tokenizer is not None and resolved_format is RecordFormat.CONVERSATIONAL:
+        template_kwargs = resolve_chat_template_kwargs(config.model, tokenizer) or None
+
     builder = TrainingRecordBuilder(
         template=config.prompt,
-        record_format=record_format or resolve_record_format(config),
+        record_format=resolved_format,
+        chat_template_kwargs=template_kwargs,
     )
     return [builder.build(example) for example in examples]
 

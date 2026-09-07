@@ -87,6 +87,7 @@ from qa_gen_runtime.config_io import (
     write_resolved_config,
 )
 from qa_gen_runtime.dataset import (
+    CHAT_TEMPLATE_KWARGS_COLUMN,
     DatasetBuildError,
     RecordFormat,
     TrainingRecordBuilder,
@@ -151,6 +152,7 @@ from qa_gen_runtime.trainer import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "CHAT_TEMPLATE_KWARGS_COLUMN",
     "DTYPE_NAMES",
     "OPTIONAL_DEPENDENCIES",
     "REASONING_TEMPLATE_FLAG",

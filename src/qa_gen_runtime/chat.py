@@ -1,4 +1,4 @@
-"""The one place a model's chat template and reasoning mode are dealt with.
+r"""The one place a model's chat template and reasoning mode are dealt with.
 
 Why this module exists at all
 ----------------------------
@@ -26,33 +26,45 @@ template does not reference it is at best ignored and at worst a Jinja error, so
 when the flag would mean nothing. A model without a thinking mode therefore needs no special
 case, and ``reasoning_mode`` is simply inert for it -- which is reported rather than silent.
 
-Who actually applies the template, and where this module is used
----------------------------------------------------------------
-Worth being precise about, because it is easy to assume this module is on the training path
-and it is not. TRL's ``SFTTrainer`` applies the chat template **itself** while preparing the
-dataset: for a conversational prompt-completion record it calls
-``processing_class.apply_chat_template`` on the prompt with ``add_generation_prompt=True`` and
-on prompt-plus-completion without, then derives the completion mask from the difference. It
-reads extra template arguments from an optional per-example ``chat_template_kwargs`` column,
-not from anything this module does.
+Who actually applies the template, and how the flag reaches it
+-------------------------------------------------------------
+Worth being precise about, because :func:`apply_chat_template` below is **not** on the training
+path. TRL's ``SFTTrainer`` applies the chat template itself while preparing the dataset: for a
+conversational prompt-completion record it calls ``processing_class.apply_chat_template`` on the
+prompt with ``add_generation_prompt=True`` and on prompt-plus-completion without, then derives
+the completion mask from the difference in length. It reads extra template arguments from an
+optional per-example ``chat_template_kwargs`` column.
 
-So during training, :func:`apply_chat_template` here is **not called**, and ``reasoning_mode``
-does not reach the tokenizer. That is deliberate rather than an oversight, and the reasoning is
-worth recording:
+So during training the mode reaches the tokenizer through that column, which
+:mod:`qa_gen_runtime.dataset` emits from :func:`chat_template_kwargs`. This module decides
+*what* to pass; the dataset layer decides *where* it goes. :func:`apply_chat_template` here is
+the inference path only.
 
-- For Qwen3 the flag only alters the ``add_generation_prompt`` branch of the template. The
-  trained sequence is the prompt-plus-completion rendering, which has no generation prompt, so
-  the flag cannot change a single trained token.
-- Setting it *would* change the prompt-only rendering, which is what the completion mask is
-  measured against. If the flag adds an empty ``<think></think>`` block to the prompt that the
-  combined rendering does not contain, the prompt is no longer a prefix of prompt-plus-completion
-  and the mask can shift -- silently training on a truncated target. Whether TRL guards that in
-  this code path is unverified.
+Why the column is not optional on Qwen3
+---------------------------------------
+An earlier version of this module argued the flag could not matter during training, on the
+grounds that it only alters the ``add_generation_prompt`` branch and the trained sequence has no
+generation prompt. A Phase 17B.2 inspection on the Studio disproved it, and the correction is
+worth stating precisely because the reasoning was wrong in an instructive way.
 
-The mode therefore matters at **inference**, where the generation prompt is the whole point, and
-that is where :func:`apply_chat_template` is used. :func:`describe_chat_handling` says which of
-the two situations a record describes, so a run's metadata never claims suppression that did not
-happen.
+Qwen3's template renders the **last** assistant turn as
+``<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}`` unconditionally --
+that branch does not consult ``enable_thinking`` at all. With no reasoning content it is an
+empty ``<think>\n\n</think>\n\n`` block in front of the target. The generation-prompt branch
+emits the same block, but only when ``enable_thinking`` is explicitly ``false``. So:
+
+- **Flag absent.** The prompt stops at ``<|im_start|>assistant\n`` and the masked completion
+  starts with the empty think block. The model is trained to emit one before every JSON object,
+  which breaks schema validation on every generation.
+- **Flag false.** Both renderings carry the block in the same position, byte for byte. The
+  prompt absorbs it and the completion begins at ``{"question_type":``.
+
+The mask stays aligned either way -- TRL passes the column to both renderings, so the prompt
+remains a byte-exact prefix. What changes is *where the boundary falls*, and only the second
+puts it in the right place.
+
+:func:`describe_chat_handling` reports which situation a record describes, so a run's metadata
+never claims a suppression that did not happen.
 """
 
 from __future__ import annotations
@@ -176,10 +188,12 @@ def describe_chat_handling(
 
     Args:
         config: The Phase 17A model configuration.
-        tokenizer: The tokenizer, when one has been loaded. Omitted during a dry run.
-        stage: ``"training"`` or ``"inference"``. Under ``"training"`` the template is applied by
-            TRL, so the mode is reported as not reaching the tokenizer. Under ``"inference"``
-            :func:`apply_chat_template` is the caller and the mode does take effect.
+        tokenizer: The tokenizer, when one has been loaded. Omitted during a dry run, where the
+            honest answer is that nothing can be determined yet.
+        stage: ``"training"`` or ``"inference"``. Under ``"training"`` TRL applies the template
+            and reads the mode from the per-example column
+            :mod:`qa_gen_runtime.dataset` emits. Under ``"inference"``
+            :func:`apply_chat_template` is the caller.
 
     Returns:
         A mapping describing the mode, whether the template understands the flag, who applies
@@ -187,23 +201,22 @@ def describe_chat_handling(
     """
     supported = template_supports_reasoning_flag(tokenizer) if tokenizer is not None else None
     applied = chat_template_kwargs(config, tokenizer) if tokenizer is not None else {}
-    if stage == "training":
+
+    if tokenizer is None:
+        effective = None
+    elif not applied:
+        effective = "inert: the template does not use the flag"
+    elif stage == "training":
         effective = (
-            "not applied: TRL renders the chat template during dataset preparation and reads "
-            "template arguments from a per-example 'chat_template_kwargs' column, which this "
-            "runtime does not emit. For Qwen3 the flag only alters the generation prompt, "
-            "which the trained sequence does not contain, so no trained token is affected."
+            "applied: qa_gen_runtime.dataset emits a per-example 'chat_template_kwargs' "
+            "column and trl.SFTTrainer passes it to both the prompt-only and the "
+            "prompt-plus-completion rendering. On Qwen3 this moves the empty "
+            "<think></think> block out of the masked completion and into the generation "
+            "prompt, so the supervised target starts at the JSON object."
         )
     else:
-        effective = (
-            None
-            if tokenizer is None
-            else (
-                "applied: passed to the tokenizer's chat template"
-                if applied
-                else "inert: the template does not use the flag"
-            )
-        )
+        effective = "applied: passed to the tokenizer's chat template"
+
     return {
         "chat_template": config.chat_template,
         "reasoning_mode": config.reasoning_mode,

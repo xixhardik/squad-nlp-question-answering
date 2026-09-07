@@ -524,6 +524,15 @@ def inspect_tokenized_record(
             if decoded_completion
             else None
         ),
+        # Checked separately from the prefix because the prefix check strips whitespace to stay
+        # robust against tokenizer quirks, and stripping would otherwise hide a mask that
+        # swallowed the prompt's trailing newlines -- teaching the model to open every answer
+        # with a blank line.
+        "completion_begins_without_leading_whitespace": (
+            decoded_completion == decoded_completion.lstrip()
+            if decoded_completion
+            else None
+        ),
         "completion_json_parses": parsed is not None if decoded_completion else None,
         "parsed_target_matches_the_source_target": (
             (parsed == source_target) if parsed is not None and source_target else None
@@ -578,13 +587,14 @@ def _describe_thinking_markers(
         ),
         "record_modified_to_remove_them": False,
         "note": (
-            "reasoning_mode does not reach the tokenizer during training: TRL applies the "
-            "chat template itself and reads template arguments from a per-example "
-            "'chat_template_kwargs' column, which this runtime does not emit. So a marker "
-            "found here came from the template's own default and is reported as measured. "
-            "Markers in the prompt half are the dangerous case, because TRL derives the "
-            "completion mask from the prompt-only rendering and an extra block there offsets "
-            "the mask into the target."
+            "counted as measured; nothing is stripped. A marker in the completion half is the "
+            "failure: Qwen3's template puts an empty <think></think> block in front of the "
+            "last assistant turn unconditionally, so without a 'chat_template_kwargs' column "
+            "carrying enable_thinking=false the block lands inside the supervised target and "
+            "the model learns to emit one before every JSON object. A marker in the prompt "
+            "half is the fixed state -- the flag makes the generation prompt carry the block "
+            "so the mask begins at the JSON. qa_gen_runtime.dataset emits that column when "
+            "the tokenizer's template understands the flag."
         ),
     }
 
@@ -1196,7 +1206,6 @@ def run_smoke(
             + "\n".join(f"  - {issue.message}" for issue in validation.errors)
         )
 
-    records = build_training_records(examples, config)
     run_root = resolve_run_root(output_dir)
     paths = _resolve_paths(
         config, mode=mode, output_dir=output_dir, run_id=run_id, run_root=run_root
@@ -1213,8 +1222,14 @@ def run_smoke(
         "nothing downloaded",
     ]
 
-    train_dataset = build_hf_dataset(records)
+    # The model is loaded before the records are rendered because the records need the
+    # tokenizer: whether the chat template understands the reasoning flag decides whether the
+    # chat_template_kwargs column is emitted, and on Qwen3 that column is what keeps the empty
+    # <think></think> block out of the supervised completion. Validation already ran above, so
+    # nothing that a laptop could have caught is deferred behind the download.
     loaded = load_trainable_model(config)
+    records = build_training_records(examples, config, tokenizer=loaded.tokenizer)
+    train_dataset = build_hf_dataset(records)
 
     with _capture_logger_warnings("trl") as trl_warnings:
         trainer, plan = build_trainer(
