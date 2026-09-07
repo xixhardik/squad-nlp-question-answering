@@ -136,6 +136,13 @@ class CatalogueEntry:
         source_id: The adapter source id.
         dataset_id: Default Hub repository, or a description when there is none.
         default_split: Split read unless overridden.
+        default_config_name: Upstream configuration read unless overridden, for a repository
+            that publishes several. ``None`` for a repository with a single default
+            configuration. Recorded here rather than left to the caller because which
+            configuration this project uses is a property of how the corpus was assessed --
+            the counts and licence in :attr:`notes` describe one configuration, not all of
+            them -- and because a repository with several and no default cannot be loaded at
+            all without one.
         hub_available: Whether the corpus can be fetched from the Hub at all.
         requires_local_path: Whether a local file is the only route.
         gated: Whether access is restricted. ``True`` means this module cannot read it,
@@ -146,6 +153,7 @@ class CatalogueEntry:
     source_id: str
     dataset_id: str
     default_split: str = "train"
+    default_config_name: str | None = None
     hub_available: bool = True
     requires_local_path: bool = False
     gated: bool = False
@@ -168,6 +176,7 @@ class CatalogueEntry:
             "source_id": self.source_id,
             "dataset_id": self.dataset_id if self.hub_available else "",
             "split": self.default_split,
+            "config_name": self.default_config_name,
         }
         base.update(overrides)
         return SourceRequest(**base)
@@ -178,6 +187,7 @@ class CatalogueEntry:
             "source_id": self.source_id,
             "dataset_id": self.dataset_id,
             "default_split": self.default_split,
+            "default_config_name": self.default_config_name,
             "hub_available": self.hub_available,
             "requires_local_path": self.requires_local_path,
             "gated": self.gated,
@@ -239,6 +249,30 @@ SOURCE_CATALOGUE: dict[str, CatalogueEntry] = {
             "a record shape rather than a dataset: supply a local JSON or JSONL file whose "
             "rows carry a passage, a stem, options and the correct option",
             "licensing depends entirely on the corpus supplied and must be checked per source",
+        ),
+    ),
+    "race-mcq": CatalogueEntry(
+        source_id="race-mcq",
+        dataset_id="ehovy/race",
+        default_split="train",
+        default_config_name="all",
+        hub_available=True,
+        notes=(
+            "public and ungated English exam questions; the 'all' configuration holds 87,866 "
+            "train, 4,887 validation and 4,934 test rows, and equals 'high' (62,445 train) "
+            "plus 'middle' (25,421 train)",
+            "the answer is an option label such as 'A', not the option's text, so the adapter "
+            "reads it with answer_style='letter'",
+            "NON-COMMERCIAL research use only, and the terms forbid redistributing any "
+            "portion of the passages or of data derived from them: a prepared corpus, a "
+            "tokenized cache and a trained adapter all count, so none may be published",
+            "about 3.3 questions share each article, so a context-grouped split keeps them "
+            "together; the article filename is deliberately not used as the example id, "
+            "because it repeats and deduplication would then discard two thirds of the corpus",
+            "passages are long: roughly 700 Qwen3 tokens per rendered record against SQuAD's "
+            "445, and a 0.9% tail exceeds a 1,024-token window until max_context_chars is "
+            "lowered to 3,000",
+            "carries no offsets, so its examples are not grounded",
         ),
     ),
 }
@@ -394,9 +428,13 @@ def describe_requirements(requests: Sequence[SourceRequest]) -> tuple[str, ...]:
         elif request.local_path:
             lines.append(f"{request.source_id}: reads the local file {request.local_path}")
         else:
+            configuration = (
+                f" configuration {request.config_name!r}," if request.config_name else ""
+            )
             lines.append(
-                f"{request.source_id}: reads {request.dataset_id} split {request.split!r} at "
-                f"revision {request.revision!r}; needs --allow-download unless already cached"
+                f"{request.source_id}: reads {request.dataset_id}{configuration} split "
+                f"{request.split!r} at revision {request.revision!r}; needs --allow-download "
+                "unless already cached"
             )
     return tuple(lines)
 

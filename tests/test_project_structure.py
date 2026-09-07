@@ -151,6 +151,13 @@ class TestGitIgnore:
             "models/final/pytorch_model.bin",
             "models/final/model.pt",
             "data/squad/train.arrow",
+            # RACE may not be redistributed, and its terms extend to derived data. The
+            # downloaded parquet, the prepared JSONL and any adapter trained on it all have
+            # to stay out of version control, so the paths each one lands on are asserted
+            # rather than assumed.
+            "data/ehovy___race/all/train/0000.parquet",
+            "artifacts/qgen-datasets/qgen-race-abc123/train.jsonl",
+            "models/qgen-race/adapter_model.safetensors",
             ".env",
             ".env.local",
             "frontend/node_modules/react/index.js",

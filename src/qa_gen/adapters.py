@@ -55,6 +55,7 @@ from qa_paper.grounding import ContentGrounding, SourceSpan
 
 __all__ = [
     "ADAPTER_REGISTRY",
+    "MCQ_ANSWER_STYLES",
     "AdapterError",
     "AdapterSpec",
     "DatasetAdapter",
@@ -70,6 +71,17 @@ __all__ = [
 
 #: Length of the digest embedded in a derived example id.
 _ID_HASH_LENGTH = 12
+
+#: How :class:`EducationalMcqAdapter` reads the ``answer`` field.
+#:
+#: ``"text"`` means the field holds the correct option's *text* and is matched against the
+#: options. ``"letter"`` means it holds an option *label* -- ``"A"`` for the first option,
+#: ``"B"`` for the second -- and is converted to an ordinal.
+#:
+#: Two values rather than an "auto" that tries both: a corpus knows which convention it uses,
+#: and guessing per record would silently reinterpret ``"A"`` as text for one record and as a
+#: label for the next. Stating the convention once makes a mismatch an error instead.
+MCQ_ANSWER_STYLES = ("text", "letter")
 
 
 class AdapterError(ValueError):
@@ -602,20 +614,43 @@ class EducationalMcqAdapter:
     differences so one adapter serves all of them, rather than four near-identical classes
     diverging over time.
 
-    The correct option may be given as an index or as the answer text; both are accepted and
-    reconciled into an index, because the canonical target stores the index and derives the
-    text. Storing both independently is how they come to disagree.
+    The correct option may be given as an index, as the answer text, or as an option label
+    like ``"A"``; all three are reconciled into an index, because the canonical target stores
+    the index and derives the text. Storing both independently is how they come to disagree.
+    Which of the latter two a corpus uses is declared by :attr:`answer_style` rather than
+    guessed per record -- see :data:`MCQ_ANSWER_STYLES`.
 
     Attributes:
-        field_map: Canonical field name to source field name.
+        source_id: The id this instance reports, on its spec and on every example it
+            produces. Overridable because one class serves several corpora and
+            ``example.source`` is what the per-source cap groups by and what the sizing
+            report names -- an instance reading RACE that called itself ``"edu-mcq"`` would
+            make the report describe a corpus nobody configured.
+        dataset_id: Upstream identifier for the corpus this instance reads. The generic
+            default describes the record shape, because the base registration is a shape
+            rather than a dataset.
+        license_note: What is known about this corpus's terms, copied onto the spec and so
+            into the run report. Overridable because the generic default -- "check it" -- is
+            the honest answer for a shape and the wrong answer for a named corpus whose
+            terms have been read.
+        field_map: Canonical field name to source field name. A canonical name left out of
+            the map falls through to itself, so omitting an entry is how you say "this
+            corpus has no such field" -- which matters for ``id``: see the ``race-mcq``
+            registration for why mapping it can be actively harmful.
         difficulty: Difficulty assigned when the record does not state one.
         marks: Marks assigned when the record does not state them.
         minimum_options: Fewest options a record may carry. Defaults to
             :data:`qa_paper.validation.MINIMUM_MCQ_OPTIONS`, so an item this adapter accepts
             is one the paper validator also accepts -- a two-option MCQ is a true/false item
             in disguise.
+        answer_style: One of :data:`MCQ_ANSWER_STYLES`. Defaults to ``"text"``, which is the
+            behaviour every caller had before the style existed, so no already-registered
+            corpus changes meaning.
     """
 
+    source_id: str = "edu-mcq"
+    dataset_id: str = "configurable; any MCQ corpus matching the field map"
+    license_note: str = "depends on the corpus supplied; must be checked per source"
     field_map: dict[str, str] = field(
         default_factory=lambda: {
             "context": "context",
@@ -630,22 +665,42 @@ class EducationalMcqAdapter:
     difficulty: Difficulty = Difficulty.MEDIUM
     marks: int = 1
     minimum_options: int = 3
+    answer_style: str = "text"
+
+    def __post_init__(self) -> None:
+        """Reject an unknown answer style at construction.
+
+        Checked here rather than on the first record so a typo surfaces when the adapter is
+        registered, not part-way through a corpus read.
+
+        Raises:
+            AdapterError: If :attr:`answer_style` is not in :data:`MCQ_ANSWER_STYLES`.
+        """
+        if self.answer_style not in MCQ_ANSWER_STYLES:
+            raise AdapterError(
+                f"answer_style must be one of {list(MCQ_ANSWER_STYLES)}, got "
+                f"{self.answer_style!r}."
+            )
 
     @property
     def spec(self) -> AdapterSpec:
         """Declarative description of the educational MCQ mapping."""
         return AdapterSpec(
-            source_id="edu-mcq",
-            dataset_id="configurable; any MCQ corpus matching the field map",
+            source_id=self.source_id,
+            dataset_id=self.dataset_id,
             description=(
                 "Educational multiple-choice questions: passage, stem, options and the "
-                "correct option given either as an index or as answer text."
+                "correct option given as an index, as answer text, or as an option label."
             ),
             record_shape={
                 "context": "the passage the question is answerable from",
                 "question": "the stem",
                 "options": "list of option strings",
-                "answer": "correct option text, or the answer when no index is given",
+                "answer": (
+                    "correct option text"
+                    if self.answer_style == "text"
+                    else "label of the correct option, 'A' for the first"
+                ),
                 "correct_index": "zero-based index of the correct option, if provided",
                 "topic": "optional subject label",
                 "id": "optional record identifier",
@@ -655,14 +710,20 @@ class EducationalMcqAdapter:
             default_difficulty=self.difficulty,
             default_marks=self.marks,
             provides_offsets=False,
-            license_note="depends on the corpus supplied; must be checked per source",
+            license_note=self.license_note,
             assignment_notes=(
                 "difficulty and marks are assigned, not read: MCQ corpora rarely label "
                 "either",
                 f"records with fewer than {self.minimum_options} options are refused, "
                 "matching qa_paper.validation.MINIMUM_MCQ_OPTIONS",
                 "the correct option is reconciled to an index; index wins when both an "
-                "index and answer text are present and they disagree",
+                "index and an answer are present and they disagree",
+                f"the answer field is read as {self.answer_style!r}: "
+                + (
+                    "matched against the option text"
+                    if self.answer_style == "text"
+                    else "an option label, where 'A' is the first option"
+                ),
             ),
         )
 
@@ -685,7 +746,7 @@ class EducationalMcqAdapter:
                 refused rather than defaulted to index 0, which would silently mislabel
                 every ambiguous record as "A".
         """
-        source_id = "edu-mcq"
+        source_id = self.source_id
         context = _require_text(record, self._source_key("context"), source_id)
         question = _require_text(record, self._source_key("question"), source_id)
         raw_options = _require(record, self._source_key("options"), source_id)
@@ -739,7 +800,11 @@ class EducationalMcqAdapter:
     def _resolve_correct_index(
         self, record: Mapping[str, Any], options: tuple[str, ...], source_id: str
     ) -> int:
-        """Determine which option is correct, from an index or from answer text."""
+        """Determine which option is correct, from an index or from the answer field.
+
+        An explicit ``correct_index`` always wins; only when there is none is the answer
+        field consulted, and then it is read according to :attr:`answer_style`.
+        """
         raw_index = record.get(self._source_key("correct_index"))
         if raw_index is not None:
             try:
@@ -762,6 +827,14 @@ class EducationalMcqAdapter:
                 "the correct option is unknown. Defaulting to the first option would "
                 "mislabel every such record."
             )
+        if self.answer_style == "letter":
+            return self._index_from_letter(answer, options, source_id)
+        return self._index_from_text(answer, options, source_id)
+
+    def _index_from_text(
+        self, answer: str, options: tuple[str, ...], source_id: str
+    ) -> int:
+        """Match the answer against the option text, case- and space-insensitively."""
         wanted = answer.strip().casefold()
         matches = [i for i, option in enumerate(options) if option.strip().casefold() == wanted]
         if not matches:
@@ -776,14 +849,76 @@ class EducationalMcqAdapter:
             )
         return matches[0]
 
+    def _index_from_letter(
+        self, answer: str, options: tuple[str, ...], source_id: str
+    ) -> int:
+        """Convert an option label to a zero-based index. ``"A"`` is the first option.
+
+        Case is normalized, so ``"b"`` and ``"B"`` both mean the second option. Nothing else
+        is normalized: a label wrapped in punctuation, spelled out, or naming an option the
+        record does not have is refused rather than guessed at. A corpus that writes ``"(A)"``
+        is a corpus this adapter has not been checked against, and reading it as ``"A"`` would
+        turn "the schema changed" into a silent relabelling of every record.
+        """
+        label = answer.strip().upper()
+        if len(label) != 1 or not ("A" <= label <= "Z"):
+            raise AdapterError(
+                f"{source_id}: answer_style is 'letter', so the answer must be a single "
+                f"option label such as 'A', got {answer!r}. Records using the option's text "
+                "instead need answer_style='text'."
+            )
+        index = ord(label) - ord("A")
+        if index >= len(options):
+            raise AdapterError(
+                f"{source_id}: answer {answer!r} names option {index + 1}, but the record "
+                f"has only {len(options)}: {list(options)}. The record is internally "
+                "inconsistent."
+            )
+        return index
+
 
 #: Every adapter this project ships, keyed by source id. Registration is the whole
 #: extension mechanism: adding a corpus means adding one entry.
+#:
+#: ``race-mcq`` is ``edu-mcq`` pointed at ``ehovy/race``, whose records carry a passage under
+#: ``article`` and an option label under ``answer``. Two details in that field map are load
+#: bearing, and both were measured against 1,000 real rows before being written down:
+#:
+#: * ``id`` is deliberately **absent**. RACE's ``example_id`` is the source *filename*, shared
+#:   by every question drawn from the same article -- about 3.3 of them. Mapping it would make
+#:   :func:`_derive_id` return one id for all of them, and
+#:   :func:`qa_gen.preparation.deduplicate_by_id` would then discard 69.6% of the corpus as
+#:   duplicates, quietly. Left unmapped, ``record.get("id")`` misses, the id falls back to a
+#:   digest of ``(context, question)``, and every question keeps its own identity. The cost is
+#:   that ``metadata["record_id"]`` is ``None``: the article filename is not retained. Split
+#:   grouping does not depend on it -- that uses the context fingerprint -- so the trade buys
+#:   two thirds of the corpus for one provenance field.
+#: * ``topic`` and ``correct_index`` are mapped to names RACE does not define, which is
+#:   harmless: both are optional and simply miss. They are listed rather than dropped so the
+#:   map reads as a complete statement of the corpus rather than an incomplete one.
 ADAPTER_REGISTRY: dict[str, DatasetAdapter] = {
     "squad-qg": SquadQuestionGenerationAdapter(),
     "lmqg-squad-qag": LmqgSquadQagAdapter(),
     "learningq-qg": LearningQAdapter(),
     "edu-mcq": EducationalMcqAdapter(),
+    "race-mcq": EducationalMcqAdapter(
+        source_id="race-mcq",
+        dataset_id="ehovy/race",
+        license_note=(
+            "non-commercial research use only, and the terms forbid redistributing any "
+            "portion of the passages or of data derived from them; a prepared corpus or a "
+            "trained adapter must therefore not be published"
+        ),
+        field_map={
+            "context": "article",
+            "question": "question",
+            "options": "options",
+            "answer": "answer",
+            "correct_index": "correct_index",
+            "topic": "topic",
+        },
+        answer_style="letter",
+    ),
 }
 
 

@@ -855,7 +855,15 @@ def format_outcome(outcome: PreparationOutcome) -> str:
             or (f"{request.dataset_id} @ {request.revision}" if request.dataset_id else "")
             or "NEEDS --source-path"
         )
-        lines.append(f"  {request.source_id:16s} {origin} split={request.split}")
+        # The configuration is shown only when there is one, because most repositories have a
+        # single default and printing "config=None" for them would be noise. It has to be shown
+        # when there is one: a repository publishing several -- ehovy/race publishes three and
+        # defaults to none -- is read differently depending on which, and a plan whose job is to
+        # say what will be fetched cannot leave that out.
+        configuration = f" config={request.config_name}" if request.config_name else ""
+        lines.append(
+            f"  {request.source_id:16s} {origin} split={request.split}{configuration}"
+        )
     if not outcome.requests:
         lines.append("  (none resolved)")
 

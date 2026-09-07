@@ -1421,16 +1421,17 @@ class TestSourceCatalogue:
 
         assert set(SOURCE_CATALOGUE) == set(registered_sources())
 
-    def test_the_four_documented_sources_are_present(self):
+    def test_the_documented_sources_are_present(self):
         assert set(SOURCE_CATALOGUE) == {
             "squad-qg",
             "lmqg-squad-qag",
             "learningq-qg",
             "edu-mcq",
+            "race-mcq",
         }
 
     def test_the_hub_backed_sources_name_a_repository(self):
-        for source_id in ("squad-qg", "lmqg-squad-qag"):
+        for source_id in ("squad-qg", "lmqg-squad-qag", "race-mcq"):
             entry = catalogue_entry(source_id)
             assert entry.hub_available
             assert "/" in entry.dataset_id
@@ -1445,6 +1446,30 @@ class TestSourceCatalogue:
     def test_no_source_is_gated(self):
         """A gated corpus would need a credential, which this pipeline does not introduce."""
         assert not any(entry.gated for entry in SOURCE_CATALOGUE.values())
+
+    def test_race_names_the_configuration_it_reads(self):
+        """``ehovy/race`` publishes three and defaults to none, so one has to be named."""
+        entry = catalogue_entry("race-mcq")
+        assert entry.default_config_name == "all"
+        assert entry.request().config_name == "all"
+
+    def test_resolving_race_carries_the_configuration_through(self):
+        """The loader reads it off the request, so it has to survive resolution."""
+        (request,) = resolve_requests(["race-mcq"])
+        assert request.dataset_id == "ehovy/race"
+        assert request.config_name == "all"
+        assert request.split == "train"
+
+    def test_the_other_sources_name_no_configuration(self):
+        """Single-configuration repositories must keep passing nothing, not 'all'."""
+        for source_id in ("squad-qg", "lmqg-squad-qag", "learningq-qg", "edu-mcq"):
+            assert catalogue_entry(source_id).default_config_name is None
+
+    def test_the_race_notes_record_the_non_commercial_terms(self):
+        """Nothing in code enforces licensing, so the catalogue is where it is written."""
+        notes = " ".join(catalogue_entry("race-mcq").notes).lower()
+        assert "non-commercial" in notes
+        assert "redistribut" in notes
 
     def test_every_entry_carries_notes(self):
         for entry in SOURCE_CATALOGUE.values():
@@ -1471,9 +1496,11 @@ class TestRequestResolution:
         assert requests[0].split == "train"
 
     def test_defaulting_skips_sources_that_need_input(self):
+        """The Hub-backed corpora resolve; the two needing a local file are left out."""
         requests = resolve_requests([])
         assert [request.source_id for request in requests] == [
             "lmqg-squad-qag",
+            "race-mcq",
             "squad-qg",
         ]
 
@@ -2439,6 +2466,121 @@ class TestShippedQgenConfigs:
         args = build_parser().parse_args(["--config", "c.yaml"])
         assert args.strict_adapters is False
 
+    def test_the_race_config_loads_and_validates(self):
+        config = self.load("qgen-race.yaml")
+        assert config.name == "qgen-race"
+        assert config.phase == "17"
+
+    def test_race_is_the_only_source(self):
+        assert self.load("qgen-race.yaml").dataset.sources == ("race-mcq",)
+
+    def test_the_race_source_is_a_registered_adapter(self):
+        from qa_gen import registered_sources
+
+        for source in self.load("qgen-race.yaml").dataset.sources:
+            assert source in registered_sources()
+
+    def test_the_race_training_stack_is_identical_to_the_squad_config(self):
+        race = self.load("qgen-race.yaml")
+        squad = self.load("qgen-squad.yaml")
+        assert race.model == squad.model
+        assert race.lora == squad.lora
+        assert race.training == squad.training
+
+    def test_only_the_race_dataset_section_differs(self):
+        race = self.load("qgen-race.yaml")
+        squad = self.load("qgen-squad.yaml")
+        assert race.dataset != squad.dataset
+        assert race.config_hash() != squad.config_hash()
+
+    def test_the_race_config_reports_no_baseline_deviations(self):
+        from qa_gen import VERIFIED_QWEN3_4B_L4
+
+        assert self.load("qgen-race.yaml").baseline_deviations(VERIFIED_QWEN3_4B_L4) == ()
+
+    def test_the_race_context_cap_removes_the_measured_truncation(self):
+        """3,000 chars, not SQuAD's 4,000: measured, 0.90% of rows overflow 1,024 at 4,000."""
+        race = self.load("qgen-race.yaml")
+        squad = self.load("qgen-squad.yaml")
+        assert race.dataset.max_context_chars == 3000
+        assert race.dataset.max_context_chars < squad.dataset.max_context_chars
+
+    def test_the_race_config_caps_the_corpus_at_twenty_thousand(self):
+        assert self.load("qgen-race.yaml").dataset.max_examples == 20000
+
+    def test_the_race_cap_is_applied_before_the_split(self):
+        """So the cap yields 18,000 train examples, i.e. 2,250 steps -- not 20,000/2,500.
+
+        Pinned because the config comment states that arithmetic and a reader will plan a
+        GPU budget from it.
+        """
+        config = self.load("qgen-race.yaml")
+        assert config.dataset.max_examples is not None
+        train = round(config.dataset.max_examples * config.dataset.train_ratio)
+        accumulation = config.training.gradient_accumulation_steps
+        batch = config.training.per_device_train_batch_size
+        assert train == 18000
+        assert train // (batch * accumulation) == 2250
+
+    def test_race_resolves_against_the_hub_without_a_local_path(self):
+        """Unlike LearningQ: ehovy/race is a real mirror, so a run needs no extra input."""
+        config = self.load("qgen-race.yaml")
+        (request,) = resolve_requests(config.dataset.sources)
+        assert request.dataset_id == "ehovy/race"
+        assert request.config_name == "all"
+        assert request_is_readable(request)
+        assert "reads ehovy/race" in describe_requirements([request])[0]
+
+    def test_the_requirement_line_names_the_configuration(self):
+        """A plan that omitted it would understate what is about to be fetched."""
+        (request,) = resolve_requests(["race-mcq"])
+        assert "configuration 'all'" in describe_requirements([request])[0]
+
+    def test_a_single_configuration_source_prints_no_configuration(self):
+        """Most repositories have one default; printing 'None' for them would be noise."""
+        (request,) = resolve_requests(["squad-qg"])
+        assert "configuration" not in describe_requirements([request])[0]
+
+    def test_a_race_row_maps_through_the_configured_source(self):
+        """End to end at the source layer: a real record shape, no renaming, letter answer."""
+        request = SourceRequest("race-mcq", dataset_id="ehovy/race", config_name="all")
+        records = [
+            {
+                "example_id": "high1729.txt",
+                "article": PASSAGE,
+                "question": "What does chlorophyll absorb?",
+                "options": ["Water", "Light", "Sugar", "Oxygen"],
+                "answer": "B",
+            }
+        ]
+        loaded = adapt_source(request, records, skip_invalid=False)
+        assert loaded.ingestion.rejected == 0
+        (item,) = loaded.examples
+        assert item.source == "race-mcq"
+        assert item.targets[0].question_type is QuestionType.MCQ
+        assert item.targets[0].answer == "Light"
+        assert item.targets[0].correct_option_index == 1
+
+    def test_race_questions_sharing_an_article_survive_deduplication(self):
+        """The 69.6% loss this guards against is silent, so it needs an explicit test."""
+        from qa_gen.preparation import deduplicate_by_id
+
+        request = SourceRequest("race-mcq", dataset_id="ehovy/race", config_name="all")
+        records = [
+            {
+                "example_id": "high1729.txt",
+                "article": PASSAGE,
+                "question": f"Question number {index}?",
+                "options": ["Water", "Light", "Sugar", "Oxygen"],
+                "answer": "B",
+            }
+            for index in range(4)
+        ]
+        loaded = adapt_source(request, records, skip_invalid=False)
+        kept, dropped = deduplicate_by_id(loaded.examples)
+        assert len(kept) == 4
+        assert dropped == ()
+
     def test_the_squad_config_is_unchanged(self):
         """Adding a corpus must not perturb the production SQuAD configuration."""
         squad = self.load("qgen-squad.yaml")
@@ -2446,16 +2588,27 @@ class TestShippedQgenConfigs:
         assert squad.dataset.sources == ("squad-qg",)
         assert squad.dataset.max_context_chars == 4000
         assert squad.dataset.train_ratio == 0.9
+        assert squad.dataset.max_examples is None
         assert squad.training.max_steps is None
 
-    def test_both_configs_are_discovered_by_the_directory_guard(self):
+    def test_the_learningq_config_is_unchanged(self):
+        learningq = self.load("qgen-learningq.yaml")
+        assert learningq.dataset.sources == ("learningq-qg",)
+        assert learningq.dataset.max_context_chars == 2000
+
+    def test_all_configs_are_discovered_by_the_directory_guard(self):
         from qa_ml.paths import find_repo_root
 
         names = {
             path.name
             for path in (find_repo_root() / "ml" / "configs" / "qgen").glob("*.yaml")
         }
-        assert {"qgen-smoke.yaml", "qgen-squad.yaml", "qgen-learningq.yaml"} <= names
+        assert {
+            "qgen-smoke.yaml",
+            "qgen-squad.yaml",
+            "qgen-learningq.yaml",
+            "qgen-race.yaml",
+        } <= names
 
 
 class TestPhaseBoundary:

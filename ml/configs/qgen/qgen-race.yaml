@@ -1,0 +1,118 @@
+name: qgen-race
+description: >-
+  RACE-only question-generation dataset. Real multiple-choice reading-comprehension
+  items from Chinese middle and high school English examinations, which is the
+  question type SQuAD structurally cannot supply: a SQuAD answer is a literal span,
+  so it yields short_answer targets with no distractors, while every RACE row
+  carries four authored options and a labelled correct one.
+phase: "17"
+
+# =============================================================================
+# Running this configuration
+# =============================================================================
+#   python -m qa_gen_runtime.prepare --config ml/configs/qgen/qgen-race.yaml --plan
+#   python -m qa_gen_runtime.prepare --config ml/configs/qgen/qgen-race.yaml \
+#     --allow-download --write-dataset
+#
+# ehovy/race is public and ungated, so no token and no --source-path are needed.
+# The catalogue names the "all" configuration, which is "high" plus "middle";
+# ehovy/race publishes three configurations and defaults to none, so one has to
+# be named or the load fails.
+#
+# Both commands are CPU-only. Run the second one and read the sizing report
+# before spending anything on a GPU.
+#
+# -----------------------------------------------------------------------------
+# LICENSING -- read before publishing anything from a run on this corpus
+# -----------------------------------------------------------------------------
+# RACE is non-commercial research use only, and its terms forbid redistributing
+# any portion of the passages OR of data derived from them. In practice:
+#
+#   * the prepared JSONL, the tokenized cache and a trained LoRA adapter all
+#     count as derived data, so none of them may be published;
+#   * .gitignore already keeps all three out of version control, and
+#     tests/test_project_structure.py asserts the specific paths;
+#   * a run on this corpus cannot back a commercial claim.
+#
+# SQuAD is CC BY-SA 4.0 and carries none of this. Mixing the two constrains the
+# combined artifact to RACE's stricter terms, so that is a deliberate choice
+# rather than a free addition.
+# =============================================================================
+
+dataset:
+  sources: [race-mcq]
+  seed: 42
+  train_ratio: 0.9
+  validation_ratio: 0.05
+  test_ratio: 0.05
+  # The adapter leaves group_key unset, so effective_group_key falls back to the
+  # context fingerprint. That is the right unit here and it needs no help: RACE
+  # attaches about 3.3 questions to each article, and every one of them shares
+  # the article verbatim, so they fingerprint identically and land in one split.
+  # Measured on 1,000 real rows: 304 articles, 304 groups.
+  group_by: context
+  min_context_chars: 64
+  # 3,000 rather than the 4,000 in qgen-squad.yaml, and this is the one dataset
+  # value that had to change. Measured with the real Qwen/Qwen3-4B tokenizer over
+  # 1,000 real rows, rendered through the production record builder:
+  #
+  #   cap 4000 -> mean 696 total tokens, 0.90% exceed the 1024-token window
+  #   cap 3000 -> mean 692 total tokens, 0.00% exceed it, 98.7% of rows kept
+  #
+  # completion_only_loss is on and truncation cuts the tail, so an over-long
+  # record loses the end of the target JSON -- the model would be supervised on
+  # malformed output. Dropping the 0.9% of articles that cause it costs almost
+  # nothing and removes the failure entirely. Raising max_seq_length would also
+  # work but pays for it on every example in VRAM and step time.
+  #
+  # Re-derive this from the sizing report's truncation rate if the template or
+  # the window changes; do not carry the number forward on faith.
+  max_context_chars: 3000
+  # Caps the mixed corpus at 20,000 usable examples out of 87,866 available.
+  #
+  # This is applied BEFORE the split (qa_gen.preparation caps at stage 5 and
+  # splits at stage 6), so the arithmetic is:
+  #
+  #   20,000 capped -> 18,000 train / 1,000 validation / 1,000 test
+  #   18,000 train / (batch 1 x accumulation 8) = 2,250 optimizer steps/epoch
+  #
+  # At the 5.29 s/step measured on an L4 for SQuAD, scaled by the 1.42x length
+  # ratio above, that is roughly 4.5-5.5 hours and about 4-5 credits for one
+  # epoch. Raise the cap only after a real run has confirmed the rate; the whole
+  # corpus is 4.4x this size and scales linearly.
+  max_examples: 20000
+
+# Identical to qgen-squad.yaml from here down: the same base model, the same
+# QLoRA configuration and the same optimisation schedule, so a result from this
+# corpus is comparable with a result from that one. Reports zero deviations from
+# qa_gen.config.VERIFIED_QWEN3_4B_L4.
+model:
+  model_id: Qwen/Qwen3-4B
+  revision: main
+  quantization: 4bit
+  quantization_type: nf4
+  double_quantization: true
+  compute_dtype: bf16
+  max_seq_length: 1024
+  reasoning_mode: disabled
+  chat_template: tokenizer
+  trust_remote_code: false
+
+training:
+  learning_rate: 0.0002
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  precision: auto
+  optimizer: paged_adamw_8bit
+  evaluation_strategy: "no"
+  save_strategy: "no"
+  load_best_model_at_end: false
+  logging_steps: 25
+  gradient_checkpointing: true
+  completion_only_loss: true
+  packing: false
+  seed: 42

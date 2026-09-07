@@ -84,6 +84,24 @@ def mcq_record(index: int = 0, **overrides):
     return {**defaults, **overrides}
 
 
+def race_record(index: int = 0, **overrides):
+    """Build a record shaped like a real ``ehovy/race`` row.
+
+    The field names and value conventions are the ones verified against the published
+    dataset card: the passage is ``article``, the correct option is a label under ``answer``,
+    ``options`` is a four-string list, and ``example_id`` is the source *filename*, which
+    repeats across every question drawn from the same article.
+    """
+    defaults = {
+        "example_id": "high1729.txt",
+        "article": f"{MITOCHONDRION} Passage note {index}.",
+        "question": f"Which organelle produces ATP? Variant {index}.",
+        "options": ["Nucleus", "Mitochondrion", "Ribosome", "Vacuole"],
+        "answer": "B",
+    }
+    return {**defaults, **overrides}
+
+
 def target(**overrides) -> QuestionGenerationTarget:
     """Build a valid short-answer target."""
     defaults = {
@@ -109,13 +127,14 @@ def example(index: int = 0, **overrides) -> QuestionGenerationExample:
 
 
 class TestAdapterRegistry:
-    """The four declared corpora."""
+    """The declared corpora."""
 
-    def test_all_four_sources_are_registered(self):
+    def test_every_declared_source_is_registered(self):
         assert registered_sources() == (
             "edu-mcq",
             "learningq-qg",
             "lmqg-squad-qag",
+            "race-mcq",
             "squad-qg",
         )
 
@@ -488,6 +507,172 @@ class TestEducationalMcqAdapter:
         result = adapter.adapt(record)
         assert result.answer == "Mitochondrion"
         assert result.topic == "Biology"
+
+    def test_the_default_style_reads_the_answer_as_text(self):
+        """The pre-existing behaviour, pinned so adding a style did not change it."""
+        assert EducationalMcqAdapter().answer_style == "text"
+
+    def test_an_unknown_style_is_refused_at_construction(self):
+        """A typo should surface on registration, not part-way through a corpus."""
+        with pytest.raises(AdapterError, match="answer_style must be one of"):
+            EducationalMcqAdapter(answer_style="letters")
+
+
+class TestMcqLetterAnswers:
+    """Reading the answer field as an option label rather than as option text."""
+
+    def adapter(self, **overrides):
+        """An MCQ adapter that reads the answer field as an option label."""
+        return EducationalMcqAdapter(answer_style="letter", **overrides)
+
+    def record(self, **overrides):
+        """An MCQ record with ``correct_index`` removed, so the answer field decides."""
+        base = mcq_record(**overrides)
+        base.pop("correct_index", None)
+        return base
+
+    @pytest.mark.parametrize(
+        ("answer", "expected"),
+        [("A", 0), ("B", 1), ("C", 2), ("D", 3)],
+    )
+    def test_each_label_maps_to_its_ordinal(self, answer, expected):
+        result = self.adapter().adapt(self.record(answer=answer))
+        assert result.primary_target.correct_option_index == expected
+
+    @pytest.mark.parametrize("answer", ["b", "B", " b ", "\tB\n"])
+    def test_case_and_surrounding_space_are_normalized(self, answer):
+        """Only case and outer whitespace. Anything else is refused, not repaired."""
+        assert self.adapter().adapt(self.record(answer=answer)).answer == "Mitochondrion"
+
+    def test_the_answer_text_is_derived_from_the_label(self):
+        result = self.adapter().adapt(self.record(answer="C"))
+        assert result.answer == "Ribosome"
+        assert result.primary_target.correct_option == "Ribosome"
+
+    def test_a_label_beyond_the_options_is_refused(self):
+        """'E' against four options means the record or the schema is wrong."""
+        with pytest.raises(AdapterError, match="names option 5, but the record has only 4"):
+            self.adapter().adapt(self.record(answer="E"))
+
+    @pytest.mark.parametrize("answer", ["(A)", "A.", "A)", "AB", "1", "first", "Mitochondrion"])
+    def test_anything_that_is_not_a_bare_label_is_refused(self, answer):
+        """Guessing here would silently relabel every record if the schema changed."""
+        with pytest.raises(AdapterError, match="must be a single option label"):
+            self.adapter().adapt(self.record(answer=answer))
+
+    def test_the_refusal_names_the_other_style_as_the_remedy(self):
+        with pytest.raises(AdapterError, match="answer_style='text'"):
+            self.adapter().adapt(self.record(answer="Mitochondrion"))
+
+    def test_an_explicit_index_still_wins_over_a_label(self):
+        """Documented precedence, unchanged by the new style."""
+        result = self.adapter().adapt(mcq_record(correct_index=2, answer="A"))
+        assert result.answer == "Ribosome"
+
+    def test_a_missing_answer_is_still_refused(self):
+        """``self.record()`` drops ``correct_index``, so this record carries neither."""
+        record = self.record()
+        assert "answer" not in record and "correct_index" not in record
+        with pytest.raises(AdapterError, match="neither correct_index nor answer text"):
+            self.adapter().adapt(record)
+
+    def test_a_label_is_not_matched_against_option_text(self):
+        """The two styles must not blend: under 'letter', 'A' is an ordinal, never a match.
+
+        These options are literally the letters A-D, so a text match would also succeed and
+        would happen to agree. It agrees here and would disagree on a shuffled corpus, so the
+        style has to decide rather than whichever check ran first.
+        """
+        result = self.adapter().adapt(
+            self.record(options=["D", "C", "B", "A"], answer="A")
+        )
+        assert result.primary_target.correct_option_index == 0
+        assert result.answer == "D"
+
+    def test_the_spec_states_which_style_is_in_use(self):
+        notes = " ".join(self.adapter().spec.assignment_notes)
+        assert "'letter'" in notes
+        assert "'A' is the first option" in notes
+
+
+class TestRaceMcqSource:
+    """The registered ``race-mcq`` adapter, against real ``ehovy/race`` record shapes."""
+
+    def adapt(self, **overrides):
+        """Map a RACE-shaped record through the registered ``race-mcq`` adapter."""
+        return adapter_for("race-mcq").adapt(race_record(**overrides))
+
+    def test_a_race_row_maps_without_any_renaming(self):
+        """The whole point of the registration: real rows go in unmodified."""
+        result = self.adapt()
+        assert result.question_type is QuestionType.MCQ
+        assert result.context.startswith("The mitochondrion")
+        assert result.options == ("Nucleus", "Mitochondrion", "Ribosome", "Vacuole")
+        assert result.answer == "Mitochondrion"
+        assert result.primary_target.correct_option_index == 1
+
+    def test_the_example_reports_its_own_source(self):
+        """Not 'edu-mcq': the per-source cap and the sizing report group by this."""
+        assert self.adapt().source == "race-mcq"
+        assert adapter_for("race-mcq").spec.source_id == "race-mcq"
+        assert adapter_for("race-mcq").spec.dataset_id == "ehovy/race"
+
+    def test_questions_sharing_an_article_keep_distinct_ids(self):
+        """``example_id`` is the article filename and repeats; ids must not.
+
+        Measured on 1,000 real rows: about 3.3 questions share each ``example_id``, so an id
+        derived from it would collide and deduplication would discard two thirds of the
+        corpus. This is the regression test for that.
+        """
+        ids = {
+            self.adapt(question=f"Question number {index}?").id
+            for index in range(5)
+        }
+        assert len(ids) == 5
+
+    def test_questions_sharing_an_article_share_a_leakage_group(self):
+        """Distinct ids, one group: both are required for a context-grouped split."""
+        groups = {
+            self.adapt(question=f"Question number {index}?").effective_group_key()
+            for index in range(5)
+        }
+        assert len(groups) == 1
+        assert next(iter(groups)).startswith("ctx:")
+
+    def test_a_different_article_lands_in_a_different_group(self):
+        assert self.adapt().effective_group_key() != self.adapt(
+            article=CHLOROPLAST
+        ).effective_group_key()
+
+    @pytest.mark.parametrize(
+        ("answer", "expected"),
+        [("A", "Nucleus"), ("B", "Mitochondrion"), ("C", "Ribosome"), ("D", "Vacuole")],
+    )
+    def test_every_label_the_corpus_uses_resolves(self, answer, expected):
+        """A-D are the only values observed across 1,000 sampled rows."""
+        assert self.adapt(answer=answer).answer == expected
+
+    def test_the_four_options_clear_the_paper_validator_minimum(self):
+        from qa_paper import MINIMUM_MCQ_OPTIONS
+
+        assert len(self.adapt().options) >= MINIMUM_MCQ_OPTIONS
+
+    def test_the_target_round_trips_into_the_paper_payload(self):
+        """RACE needs no change to the canonical target or the paper representation."""
+        payload = self.adapt().primary_target.to_payload()
+        assert payload.options == ("Nucleus", "Mitochondrion", "Ribosome", "Vacuole")
+        assert payload.correct_index == 1
+
+    def test_the_spec_records_the_non_commercial_terms(self):
+        note = adapter_for("race-mcq").spec.license_note
+        assert "non-commercial" in note.lower()
+
+    def test_the_default_edu_mcq_registration_is_untouched(self):
+        """Adding RACE must not have changed the corpus that shares its class."""
+        edu = adapter_for("edu-mcq")
+        assert edu.spec.source_id == "edu-mcq"
+        assert edu.answer_style == "text"
+        assert edu.adapt(mcq_record()).source == "edu-mcq"
 
 
 class TestBatchAdaptation:
