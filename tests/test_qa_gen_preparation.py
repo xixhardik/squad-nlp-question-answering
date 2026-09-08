@@ -3016,12 +3016,90 @@ class TestShippedQgenConfigs:
         assert mixed.dataset.min_context_chars == 64
 
     def test_the_mixed_training_stack_is_identical_to_the_squad_config(self):
-        """Only the corpus may differ, so the three results stay comparable."""
+        """Only the corpus and the checkpoint interval may differ.
+
+        The mixed config checkpoints periodically so a four-hour run is resumable, which
+        qgen-squad.yaml does not. That is a durability setting, not an optimisation one: it
+        changes what an interruption costs and nothing the model learns. So the comparison
+        excludes exactly those three fields and asserts everything else matches, rather than
+        being dropped for being inconvenient.
+        """
+        import dataclasses
+
         mixed = self.load("qgen-mixed.yaml")
         squad = self.load("qgen-squad.yaml")
         assert mixed.model == squad.model
         assert mixed.lora == squad.lora
-        assert mixed.training == squad.training
+
+        checkpointing = {"save_strategy", "save_steps", "save_total_limit"}
+        normalized = dataclasses.replace(
+            mixed.training,
+            **{name: getattr(squad.training, name) for name in checkpointing},
+        )
+        assert normalized == squad.training
+
+    def test_only_the_checkpoint_fields_differ_from_the_squad_config(self):
+        """Names the deviation, so a future edit cannot hide behind the exclusion above."""
+        import dataclasses
+
+        mixed = self.load("qgen-mixed.yaml").training
+        squad = self.load("qgen-squad.yaml").training
+        differing = {
+            item.name
+            for item in dataclasses.fields(mixed)
+            if getattr(mixed, item.name) != getattr(squad, item.name)
+        }
+        assert differing == {"save_strategy", "save_steps"}
+
+    def test_the_mixed_optimisation_settings_are_untouched(self):
+        """The settings the L4 measurement covered, pinned against the resumability change."""
+        training = self.load("qgen-mixed.yaml").training
+        assert training.learning_rate == 0.0002
+        assert training.per_device_train_batch_size == 1
+        assert training.gradient_accumulation_steps == 8
+        assert training.effective_batch_size == 8
+        assert training.num_train_epochs == 1
+        assert training.warmup_ratio == 0.03
+        assert training.lr_scheduler_type == "cosine"
+        assert training.optimizer == "paged_adamw_8bit"
+        assert training.gradient_checkpointing is True
+        assert training.completion_only_loss is True
+        assert training.packing is False
+        assert training.seed == 42
+        assert training.max_steps is None
+
+    def test_the_mixed_config_is_resumable(self):
+        """The point of the change: a run that dies at step 2,000 need not start over."""
+        assert self.load("qgen-mixed.yaml").training.is_resumable is True
+
+    def test_the_mixed_config_checkpoints_every_five_hundred_steps(self):
+        training = self.load("qgen-mixed.yaml").training
+        assert training.save_strategy == "steps"
+        assert training.save_steps == 500
+        assert training.save_total_limit == 2
+
+    def test_the_checkpoint_interval_divides_the_run_into_useful_pieces(self):
+        """500 steps of 2,248 is about a quarter of the run, so an interruption costs a quarter.
+
+        Asserted as a relationship rather than a number, so changing the epoch count or the
+        corpus size makes this fail rather than silently leaving a 500-step interval on a
+        300-step run, where it would never fire.
+        """
+        config = self.load("qgen-mixed.yaml")
+        train = round(config.dataset.max_examples * config.dataset.train_ratio)
+        total = estimate_step_count(
+            train, batch_size=1, gradient_accumulation_steps=8, epochs=1
+        ).total_steps
+        assert config.training.save_steps is not None
+        assert config.training.save_steps < total
+        assert total // config.training.save_steps >= 2
+
+    def test_the_other_configs_are_not_resumable_and_say_so(self):
+        """Unchanged, and worth pinning: only the production mixed run got this treatment."""
+        for name in ("qgen-squad.yaml", "qgen-race.yaml", "qgen-learningq.yaml"):
+            training = self.load(name).training
+            assert training.save_steps is None, name
+        assert self.load("qgen-squad.yaml").training.save_strategy == "no"
 
     def test_the_mixed_config_keeps_the_measured_qlora_settings(self):
         config = self.load("qgen-mixed.yaml")

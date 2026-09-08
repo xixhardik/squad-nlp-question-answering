@@ -109,8 +109,7 @@ __all__ = [
 #: The machine-readable final report, written into the run directory.
 TRAINING_REPORT_FILENAME = "training.json"
 
-#: Save strategies under which a checkpoint can exist to resume from.
-_RESUMABLE_SAVE_STRATEGIES = ("steps", "epoch")
+
 
 
 class ProductionTrainingError(RuntimeError):
@@ -695,6 +694,11 @@ class ProductionTrainingReport:
         completed_optimizer_steps: Steps the trainer reports completing.
         warmup_steps: Warmup steps, converted from the ratio.
         resumed_from: The checkpoint resumed from, or ``None``.
+        resumable: Whether this run wrote checkpoints it could later be resumed from.
+            Recorded at the time it started, because it is the difference between an
+            interruption costing an interval and costing everything.
+        save_strategy: When checkpoints were written.
+        save_steps: The checkpoint interval, when one was set.
         adapter_path: Where the adapter was saved.
         adapter_bytes: Size of the adapter checkpoint on disk.
         trainable_parameters: Parameters that trained.
@@ -732,6 +736,9 @@ class ProductionTrainingReport:
     completed_optimizer_steps: int | None = None
     warmup_steps: int | None = None
     resumed_from: str | None = None
+    resumable: bool = False
+    save_strategy: str = ""
+    save_steps: int | None = None
     adapter_path: str | None = None
     adapter_bytes: int | None = None
     trainable_parameters: int | None = None
@@ -778,6 +785,9 @@ class ProductionTrainingReport:
                 "completed_optimizer_steps": self.completed_optimizer_steps,
                 "warmup_steps": self.warmup_steps,
                 "resumed_from": self.resumed_from,
+                "resumable": self.resumable,
+                "save_strategy": self.save_strategy,
+                "save_steps": self.save_steps,
             },
             "adapter": {
                 "path": self.adapter_path,
@@ -900,16 +910,14 @@ def execute_production_training(
 
     config = load_experiment_config(config_path)
 
-    if resume_from_checkpoint and config.training.save_strategy not in (
-        _RESUMABLE_SAVE_STRATEGIES
-    ):
+    if resume_from_checkpoint and not config.training.is_resumable:
         raise ProductionTrainingError(
             f"cannot resume: training.save_strategy is "
             f"{config.training.save_strategy!r}, so this configuration writes no "
             "checkpoints and there is nothing to resume from.\n"
-            f"Resuming needs save_strategy to be one of {list(_RESUMABLE_SAVE_STRATEGIES)} on "
-            "the run being resumed. Starting from scratch here would look like a resume and "
-            "silently repeat work, so it is refused instead."
+            "Resuming needs save_strategy to be 'steps' or 'epoch' on the run being resumed. "
+            "Starting from scratch here would look like a resume and silently repeat work, so "
+            "it is refused instead."
         )
 
     # --- the corpus, before anything expensive ----------------------------
@@ -1303,6 +1311,9 @@ def _base_report(
         total_optimizer_steps=getattr(plan, "total_steps", None),
         warmup_steps=getattr(plan, "warmup_steps", None),
         resumed_from=resumed_from,
+        resumable=config.training.is_resumable,
+        save_strategy=config.training.save_strategy,
+        save_steps=config.training.save_steps,
         adapter_path=paths.adapter.as_posix(),
         trainable_parameters=loaded.trainable_parameters,
         total_parameters=loaded.total_parameters,

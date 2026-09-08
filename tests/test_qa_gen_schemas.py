@@ -831,6 +831,50 @@ class TestTrainingConfig:
         with pytest.raises(GenerationConfigError, match="metric_for_best_model"):
             TrainingConfig(metric_for_best_model="bleu").validate()
 
+    def test_no_checkpoint_interval_by_default(self):
+        """Absent means "inherit the trainer's own default", which is 500."""
+        assert TrainingConfig().save_steps is None
+
+    def test_a_checkpoint_interval_validates_with_step_checkpointing(self):
+        TrainingConfig(
+            save_strategy="steps",
+            save_steps=500,
+            evaluation_strategy="no",
+            load_best_model_at_end=False,
+        ).validate()
+
+    def test_a_non_positive_checkpoint_interval_is_rejected(self):
+        with pytest.raises(GenerationConfigError, match="save_steps"):
+            TrainingConfig(save_strategy="steps", save_steps=0).validate()
+
+    def test_a_checkpoint_interval_without_step_checkpointing_is_rejected(self):
+        """Accepting a value transformers ignores would make a run look resumable."""
+        with pytest.raises(GenerationConfigError, match="ignores it"):
+            TrainingConfig(
+                save_strategy="epoch", save_steps=500, evaluation_strategy="epoch"
+            ).validate()
+
+    def test_a_checkpoint_interval_is_rejected_when_nothing_is_saved(self):
+        with pytest.raises(GenerationConfigError, match="save_steps"):
+            TrainingConfig(
+                save_strategy="no",
+                save_steps=500,
+                evaluation_strategy="no",
+                load_best_model_at_end=False,
+            ).validate()
+
+    @pytest.mark.parametrize(
+        ("strategy", "resumable"),
+        [("steps", True), ("epoch", True), ("no", False)],
+    )
+    def test_resumability_follows_the_save_strategy(self, strategy, resumable):
+        """Resuming needs a checkpoint to resume from, so this is a save_strategy question."""
+        assert TrainingConfig(save_strategy=strategy).is_resumable is resumable
+
+    def test_the_default_schedule_is_resumable(self):
+        """save_strategy defaults to 'epoch', so a default run writes something."""
+        assert TrainingConfig().is_resumable is True
+
     @pytest.mark.parametrize("metric", ["loss", *VALID_METRICS])
     def test_every_known_metric_is_accepted_for_ranking(self, metric):
         TrainingConfig(metric_for_best_model=metric, greater_is_better=True).validate()

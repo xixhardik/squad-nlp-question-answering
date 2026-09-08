@@ -1170,6 +1170,46 @@ class TestTrainerArgumentTranslation:
         plan = plan_trainer_arguments(config(), "/tmp/out", train_examples=100)
         assert "max_steps" not in plan.arguments
 
+    def test_save_steps_is_omitted_when_unset(self):
+        """Omitted rather than passed as None: some versions type-check before the strategy."""
+        plan = plan_trainer_arguments(config(), "/tmp/out", train_examples=100)
+        assert "save_steps" not in plan.arguments
+
+    #: Step checkpointing without best-model selection, which is the production shape.
+    #: ``load_best_model_at_end`` defaults to true and would demand that ``save_strategy``
+    #: match ``evaluation_strategy``, so it is turned off here rather than worked around.
+    _STEP_CHECKPOINTING = {
+        "save_strategy": "steps",
+        "evaluation_strategy": "no",
+        "load_best_model_at_end": False,
+    }
+
+    def test_save_steps_is_forwarded_when_set(self):
+        plan = plan_trainer_arguments(
+            config(training={**self._STEP_CHECKPOINTING, "save_steps": 500}),
+            "/tmp/out",
+            train_examples=100,
+        )
+        assert plan.arguments["save_steps"] == 500
+        assert plan.arguments["save_strategy"] == "steps"
+
+    def test_a_forwarded_save_interval_is_noted_as_resumable(self):
+        """The note is where a reader finds out an interruption is survivable."""
+        plan = plan_trainer_arguments(
+            config(training={**self._STEP_CHECKPOINTING, "save_steps": 500}),
+            "/tmp/out",
+            train_examples=100,
+        )
+        assert any("resumable" in note for note in plan.notes)
+
+    def test_step_checkpointing_without_an_interval_says_the_default_applies(self):
+        """500 is transformers' own default, and inheriting it silently is worth flagging."""
+        plan = plan_trainer_arguments(
+            config(training=dict(self._STEP_CHECKPOINTING)), "/tmp/out", train_examples=100
+        )
+        assert "save_steps" not in plan.arguments
+        assert any("default of 500" in note for note in plan.notes)
+
     def test_the_plan_is_json_serializable(self):
         plan = plan_trainer_arguments(config(), "/tmp/out", train_examples=100)
         payload = json.loads(json.dumps(plan.as_dict()))

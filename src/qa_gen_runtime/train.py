@@ -489,6 +489,8 @@ def _format_training_text(report: Any) -> str:
         f"  planned steps     {report.total_optimizer_steps}",
         f"  completed steps   {report.completed_optimizer_steps}",
         f"  warmup steps      {report.warmup_steps}",
+        f"  checkpointing     save_strategy={report.save_strategy} "
+        f"save_steps={report.save_steps} (resumable={report.resumable})",
         f"  resumed from      {report.resumed_from}",
         "",
         "[ PREFLIGHT ]",

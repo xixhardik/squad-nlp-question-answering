@@ -174,8 +174,31 @@ training:
   precision: auto
   optimizer: paged_adamw_8bit
   evaluation_strategy: "no"
-  save_strategy: "no"
+
+  # Periodic checkpointing, which is what makes this run resumable. The only
+  # deviation from qgen-squad.yaml's schedule, and it changes no optimisation
+  # setting: checkpoint frequency affects what an interruption costs, not what
+  # the model learns.
+  #
+  # With save_strategy "no" -- the previous value here -- nothing is written, so a
+  # run that dies at step 2,000 of 2,248 has to start over and the four hours are
+  # gone. At 500 steps and roughly 6.5 s/step that is a checkpoint about every 55
+  # minutes, so an interruption costs at most that much rather than everything.
+  #
+  # The runtime refuses --resume-from-checkpoint against a configuration that
+  # cannot have produced a checkpoint, so this value is what makes resuming
+  # possible at all rather than merely permitted.
+  save_strategy: steps
+  save_steps: 500
+  # Two checkpoints retained: the newest to resume from and one behind it, in case
+  # the newest was written during the failure. Bounded because a PEFT checkpoint is
+  # adapter tensors plus optimiser state, not a copy of the 4B base.
+  save_total_limit: 2
+  # Still off, and still required to be: ranking checkpoints needs an evaluation
+  # metric, and evaluation_strategy is "no". Leaving it true here would fail
+  # validation rather than silently pick a checkpoint by nothing.
   load_best_model_at_end: false
+
   logging_steps: 25
   gradient_checkpointing: true
   completion_only_loss: true

@@ -578,16 +578,17 @@ class TestExecutionCallsTrain:
         assert payload["tokenizer_id"] == "Qwen/Qwen3-4B"
         assert payload["fingerprint"] == FIXTURE_FINGERPRINT
 
-    def test_resume_is_passed_through_to_the_trainer(
+    def test_resume_is_refused_when_nothing_was_checkpointed(
         self, config_path, prepared_corpus, tmp_path, stub_stack
     ):
+        """``save_strategy: "no"`` cannot have produced a checkpoint, so resuming is refused."""
         path = tmp_path / "qgen-runs" / "test-run"
         path.mkdir(parents=True)
         checkpoint = path / "checkpoint-500"
         checkpoint.mkdir()
         config = load_experiment_config(config_path)
         assert config.training.save_strategy == "no"
-        # save_strategy "no" cannot have produced a checkpoint, so this must be refused.
+        assert config.training.is_resumable is False
         with pytest.raises(ProductionTrainingError, match="cannot resume"):
             run(
                 config_path,
@@ -595,6 +596,141 @@ class TestExecutionCallsTrain:
                 tmp_path,
                 resume_from_checkpoint=str(checkpoint),
             )
+
+
+class TestResumableRuns:
+    """A configuration that checkpoints can be resumed, and the report says so."""
+
+    @pytest.fixture
+    def resumable_config(self, tmp_path: Path) -> str:
+        """The test configuration, plus periodic checkpointing."""
+        path = tmp_path / "qgen-resumable.yaml"
+        path.write_text(
+            "\n".join(
+                [
+                    "name: qgen-test",
+                    'phase: "18"',
+                    "dataset:",
+                    "  sources: [squad-qg, race-mcq]",
+                    "model:",
+                    "  model_id: Qwen/Qwen3-4B",
+                    "  max_seq_length: 1024",
+                    "  reasoning_mode: disabled",
+                    "training:",
+                    "  per_device_train_batch_size: 1",
+                    "  gradient_accumulation_steps: 8",
+                    "  num_train_epochs: 1",
+                    "  warmup_ratio: 0.03",
+                    '  evaluation_strategy: "no"',
+                    "  save_strategy: steps",
+                    "  save_steps: 500",
+                    "  save_total_limit: 2",
+                    "  load_best_model_at_end: false",
+                    "  completion_only_loss: true",
+                    "  gradient_checkpointing: true",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_the_configuration_reports_itself_resumable(self, resumable_config):
+        training = load_experiment_config(resumable_config).training
+        assert training.is_resumable is True
+        assert training.save_strategy == "steps"
+        assert training.save_steps == 500
+        assert training.save_total_limit == 2
+
+    def test_resume_reaches_the_trainer(
+        self, resumable_config, prepared_corpus, tmp_path, stub_stack
+    ):
+        """The whole point: the checkpoint path arrives at ``trainer.train()``."""
+        run_dir = tmp_path / "qgen-runs" / "resumed"
+        checkpoint = run_dir / "checkpoint-500"
+        checkpoint.mkdir(parents=True)
+        report = run(
+            resumable_config,
+            prepared_corpus,
+            tmp_path,
+            run_id="resumed",
+            resume_from_checkpoint=str(checkpoint),
+        )
+        assert stub_stack["trainer"].train_calls == [
+            {"resume_from_checkpoint": str(checkpoint)}
+        ]
+        assert report.resumed_from == str(checkpoint)
+        assert report.success is True
+
+    def test_resuming_reopens_the_existing_run_directory(
+        self, resumable_config, prepared_corpus, tmp_path, stub_stack
+    ):
+        """Without ``allow_existing`` the directory holding the checkpoint would be refused."""
+        run_dir = tmp_path / "qgen-runs" / "resumed"
+        checkpoint = run_dir / "checkpoint-500"
+        checkpoint.mkdir(parents=True)
+        run(
+            resumable_config,
+            prepared_corpus,
+            tmp_path,
+            run_id="resumed",
+            resume_from_checkpoint=str(checkpoint),
+        )
+        assert checkpoint.is_dir(), "the checkpoint must survive the run it seeded"
+
+    def test_a_fresh_run_under_a_resumable_config_passes_no_checkpoint(
+        self, resumable_config, prepared_corpus, tmp_path, stub_stack
+    ):
+        """Resumable does not mean resuming; a first run still starts from scratch."""
+        report = run(resumable_config, prepared_corpus, tmp_path, run_id="fresh")
+        assert stub_stack["trainer"].train_calls == [{"resume_from_checkpoint": None}]
+        assert report.resumed_from is None
+        assert report.resumable is True
+
+    def test_the_report_records_the_checkpoint_schedule(
+        self, resumable_config, prepared_corpus, tmp_path, stub_stack
+    ):
+        report = run(resumable_config, prepared_corpus, tmp_path, run_id="recorded")
+        assert report.resumable is True
+        assert report.save_strategy == "steps"
+        assert report.save_steps == 500
+        payload = json.loads(json.dumps(report.as_dict(), default=str))
+        assert payload["schedule"]["resumable"] is True
+        assert payload["schedule"]["save_steps"] == 500
+
+    def test_a_non_resumable_run_records_that_too(
+        self, config_path, prepared_corpus, tmp_path, stub_stack
+    ):
+        """The unchanged config, so the field distinguishes the two rather than always true."""
+        report = run(config_path, prepared_corpus, tmp_path, run_id="not-resumable")
+        assert report.resumable is False
+        assert report.save_strategy == "no"
+        assert report.save_steps is None
+
+    def test_checkpointing_does_not_write_base_model_weights(
+        self, resumable_config, prepared_corpus, tmp_path, stub_stack
+    ):
+        """Enabling checkpoints must not turn an adapter-only run into a 8 GB one.
+
+        TRL checkpoints a PEFT model as adapter tensors, so the audit that guards the final
+        artifact guards the intermediate ones too. Asserted here because "we now save
+        periodically" is exactly the change that could have broken it.
+        """
+        report = run(resumable_config, prepared_corpus, tmp_path, run_id="ckpt-audit")
+        assert report.output_audit["base_weight_files"] == []
+        assert report.output_audit["oversized_files"] == []
+        run_dir = tmp_path / "qgen-runs" / "ckpt-audit"
+        names = {path.name for path in run_dir.rglob("*") if path.is_file()}
+        assert not {
+            name for name in names if name.startswith("model") and name.endswith(".safetensors")
+        }
+
+    def test_the_preflight_still_passes_under_periodic_checkpointing(
+        self, resumable_config, prepared_corpus, tmp_path, stub_stack
+    ):
+        report = run(resumable_config, prepared_corpus, tmp_path, run_id="preflight-ckpt")
+        assert report.preflight.ok
+        assert report.preflight.failed == ()
 
 
 class TestAdapterOnlyOutput:

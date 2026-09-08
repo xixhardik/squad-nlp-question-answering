@@ -248,6 +248,20 @@ def plan_trainer_arguments(
     if training.max_steps is not None:
         arguments["max_steps"] = training.max_steps
 
+    if training.save_steps is not None:
+        # Only when set. transformers defaults save_steps to 500, and passing None explicitly
+        # is not the same as omitting it -- some versions validate the type before the strategy.
+        arguments["save_steps"] = training.save_steps
+        notes.append(
+            f"save_steps={training.save_steps} with save_strategy="
+            f"{training.save_strategy!r}: the run is resumable from the last checkpoint"
+        )
+    elif training.save_strategy == "steps":
+        notes.append(
+            "save_strategy is 'steps' with no save_steps, so the trainer's own default of 500 "
+            "applies; set training.save_steps to choose the interval deliberately"
+        )
+
     if training.gradient_checkpointing:
         # Non-reentrant checkpointing is what works with PEFT adapters; the reentrant
         # implementation drops the adapter gradients on some architectures.

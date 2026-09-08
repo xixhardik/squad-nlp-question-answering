@@ -743,7 +743,14 @@ class TrainingConfig:
         save_strategy: When to checkpoint. Must match ``evaluation_strategy`` when
             ``load_best_model_at_end`` is set, for the same reason as in
             :class:`qa_ml.config.TrainingConfig`: otherwise the best checkpoint may never
-            have been written.
+            have been written. Also decides whether a run can be resumed at all: with
+            ``"no"`` nothing is written, so there is nothing to resume from.
+        save_steps: Optimiser steps between checkpoints, when ``save_strategy`` is
+            ``"steps"``. ``None`` leaves the trainer's own default, which is 500. Stated
+            explicitly for a long run rather than inherited, because it is the interval that
+            decides how much work an interruption costs, and inheriting it means that figure
+            is a library default nobody chose. Setting it with any other ``save_strategy`` is
+            rejected instead of ignored.
         logging_steps: Step interval for training logs.
         save_total_limit: Checkpoints retained.
         load_best_model_at_end: Restore the best adapter after training.
@@ -785,6 +792,7 @@ class TrainingConfig:
     optimizer: str = "paged_adamw_8bit"
     evaluation_strategy: str = "epoch"
     save_strategy: str = "epoch"
+    save_steps: int | None = None
     logging_steps: int = 25
     save_total_limit: int = 2
     load_best_model_at_end: bool = True
@@ -802,6 +810,21 @@ class TrainingConfig:
     def effective_batch_size(self) -> int:
         """Optimiser-step batch size on one device."""
         return self.per_device_train_batch_size * self.gradient_accumulation_steps
+
+    @property
+    def is_resumable(self) -> bool:
+        """Whether a run under this schedule could be resumed after an interruption.
+
+        Resuming needs a checkpoint to resume *from*, so this is a fact about
+        :attr:`save_strategy` rather than about any resume flag. ``"no"`` writes nothing, and a
+        run that dies four hours in has to start over.
+
+        Exposed as a property because two callers need the same answer and must not disagree:
+        the production runtime refuses ``--resume-from-checkpoint`` against a configuration
+        that cannot have produced one, and the report records whether the run was resumable at
+        the time it started.
+        """
+        return self.save_strategy in ("steps", "epoch")
 
     def validate(self) -> None:
         """Check the training settings.
@@ -866,6 +889,19 @@ class TrainingConfig:
             raise GenerationConfigError(
                 f"training.save_total_limit must be positive, got {self.save_total_limit}."
             )
+        if self.save_steps is not None:
+            if self.save_steps <= 0:
+                raise GenerationConfigError(
+                    "training.save_steps must be a positive integer or null, got "
+                    f"{self.save_steps}."
+                )
+            if self.save_strategy != "steps":
+                raise GenerationConfigError(
+                    f"training.save_steps is {self.save_steps} but save_strategy is "
+                    f"{self.save_strategy!r}, which ignores it. Set save_strategy to 'steps' "
+                    "to checkpoint on an interval, or leave save_steps null. Accepting a "
+                    "value that does nothing would make a run look resumable when it is not."
+                )
         if self.early_stopping_patience is not None and self.early_stopping_patience <= 0:
             raise GenerationConfigError(
                 "training.early_stopping_patience must be a positive integer or null, "
