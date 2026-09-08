@@ -1720,31 +1720,41 @@ class TestCli:
         assert code == 1
         assert "not found" in capsys.readouterr().err
 
-    def test_execute_training_refuses_in_this_phase(self, capsys):
-        """The factory is built; wiring trainer.train() is 17B.2."""
+    def test_plan_and_execute_training_cannot_be_combined(self):
+        """Argparse rejects the pair, so a plan command is never one typo from a real run."""
+        with pytest.raises(SystemExit) as excinfo:
+            build_parser().parse_args(
+                ["--config", "c.yaml", "--plan", "--execute-training"]
+            )
+        assert excinfo.value.code == 2
+
+    def test_execute_training_does_not_fall_back_to_validation(self, capsys):
+        """It either trains or fails. Printing a validation report would imply it had run."""
         code = main(
             [
                 "--config",
                 self.smoke_config_path(),
                 "--execute-training",
+                "--dataset-dir",
+                "definitely-not-a-directory",
                 "--log-level",
                 "WARNING",
             ]
         )
-        assert code == 1
-        assert "Phase 17B.1" in capsys.readouterr().err
+        assert code != 0
+        assert "Qwen/Qwen3-4B" not in capsys.readouterr().out
 
-    def test_execute_training_still_validates_first(self, capsys):
-        main(
-            [
-                "--config",
-                self.smoke_config_path(),
-                "--execute-training",
-                "--log-level",
-                "WARNING",
-            ]
-        )
-        assert "Qwen/Qwen3-4B" in capsys.readouterr().out
+    def test_the_execution_flags_default_to_nothing_selected(self):
+        """Every execution-only flag is absent by default, so validation is unaffected."""
+        args = build_parser().parse_args(["--config", "c.yaml"])
+        assert args.dataset_dir is None
+        assert args.dataset_fingerprint is None
+        assert args.eval_split is None
+        assert args.run_id is None
+        assert args.resume_from_checkpoint is None
+        assert args.expect_train_examples is None
+        assert args.expect_source_count == []
+        assert args.split == "train"
 
     def test_the_report_names_the_record_format(self):
         report = run_validation(self.smoke_config_path())

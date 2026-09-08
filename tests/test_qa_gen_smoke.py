@@ -1633,17 +1633,29 @@ class TestCli:
 class TestPhaseBoundary:
     """What this phase deliberately does not do."""
 
-    def test_the_full_corpus_training_entry_point_still_refuses(self, capsys):
-        """`qa_gen_runtime.train --execute-training` is unchanged and still declines."""
-        from qa_gen_runtime.train import main as train_main
+    def test_the_full_corpus_entry_point_is_a_separate_command(self):
+        """Phase 18 wired `train --execute-training`; this harness is still the bounded one.
 
-        code = train_main(
-            ["--config", smoke_config_path(), "--execute-training", "--log-level", "WARNING"]
-        )
-        assert code == 1
-        error = capsys.readouterr().err
-        assert "Phase 17B.1" in error
-        assert "qa_gen_runtime.smoke" in error
+        The two must not converge. ``train --execute-training`` steps over a whole prepared
+        corpus and needs one to exist; this harness builds six examples in memory and takes a
+        handful of steps. Asserted because the cheap way to "reuse" the harness for production
+        would be to widen its corpus, and then nothing would be bounded any more.
+        """
+        from qa_gen_runtime.train import build_parser as train_parser
+
+        train_flags = {
+            action.dest for action in train_parser()._actions  # noqa: SLF001 - parser introspection
+        }
+        assert "dataset_fingerprint" in train_flags
+        assert "execute_training" in train_flags
+
+        smoke_flags = {action.dest for action in build_parser()._actions}  # noqa: SLF001
+        assert "dataset_fingerprint" not in smoke_flags
+        assert smoke_flags & {"inspect_only", "run"} == {"inspect_only", "run"}
+
+    def test_the_smoke_corpus_is_still_six_hand_written_examples(self):
+        """The production path reads a prepared corpus; this one does not read anything."""
+        assert len(build_smoke_examples()) == 6
 
     def test_no_answerability_verification_is_wired_up(self):
         """DeBERTa answerability checking is a later phase; nothing here pretends otherwise."""
